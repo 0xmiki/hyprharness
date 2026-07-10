@@ -18,7 +18,7 @@ pub struct App {
 enum Command {
     /// Run the MCP server over stdio.
     Mcp {
-        /// Disable all pointer actions.
+        /// Disable all focus, pointer, and keyboard actions.
         #[arg(long)]
         read_only: bool,
         /// Override the JSONL audit log path.
@@ -95,7 +95,11 @@ async fn doctor(as_json: bool) -> crate::Result<()> {
         Ok(()) => json!({"ok": true}),
         Err(error) => error.as_json(),
     };
-    let healthy = [&version, &monitors, &screenshot, &input]
+    let keyboard = match harness.keyboard_probe().await {
+        Ok(()) => json!({"ok": true}),
+        Err(error) => error.as_json(),
+    };
+    let healthy = [&version, &monitors, &screenshot, &input, &keyboard]
         .into_iter()
         .all(|value| value["ok"] == true);
     let report = json!({
@@ -104,7 +108,9 @@ async fn doctor(as_json: bool) -> crate::Result<()> {
         "monitors": monitors,
         "screenshot": screenshot,
         "virtual_pointer": input,
+        "virtual_keyboard": keyboard,
         "grim": harness.capture_executable(),
+        "wtype": harness.keyboard_executable(),
         "audit_log": harness.audit_path(),
         "read_only": harness.read_only(),
     });
@@ -157,9 +163,17 @@ async fn test_pointer(distance: i32, click: bool) -> crate::Result<()> {
         Point { x: origin.x, y },
     ];
     for point in points {
-        harness.move_pointer(point, 150).await?;
+        harness
+            .move_pointer(point, Some(150), crate::models::MotionProfile::Smooth)
+            .await?;
     }
-    harness.move_pointer(origin.clone(), 150).await?;
+    harness
+        .move_pointer(
+            origin.clone(),
+            Some(150),
+            crate::models::MotionProfile::Smooth,
+        )
+        .await?;
     if click {
         harness
             .click(crate::models::MouseButton::Left, 1, 120)
@@ -189,11 +203,16 @@ async fn permissions(as_json: bool) -> crate::Result<()> {
         Ok(()) => json!({"ok": true, "available": true}),
         Err(error) => error.as_json(),
     };
+    let keyboard = match harness.keyboard_probe().await {
+        Ok(()) => json!({"ok": true, "available": true, "backend": "wtype"}),
+        Err(error) => error.as_json(),
+    };
     let report = json!({
         "hyprland_permission_enforcement": option,
         "session_locked": locked,
         "screencopy": screencopy,
         "virtual_pointer": input,
+        "virtual_keyboard": keyboard,
         "server_input_default": "enabled",
         "read_only_escape_hatch": "hyprharness mcp --read-only",
         "audit_log": harness.audit_path(),

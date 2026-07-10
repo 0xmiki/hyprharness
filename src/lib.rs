@@ -5,6 +5,7 @@ pub mod error;
 pub mod harness;
 pub mod input;
 pub mod ipc;
+pub mod keyboard;
 pub mod mcp;
 pub mod models;
 pub mod policy;

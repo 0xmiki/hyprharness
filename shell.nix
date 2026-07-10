@@ -13,6 +13,7 @@ pkgs.mkShell {
     wayland
     wayland-protocols
     grim
+    wtype
   ];
 
   env = {

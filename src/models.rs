@@ -135,6 +135,77 @@ pub enum MouseButton {
     Right,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionProfile {
+    /// A subtly curved, accelerated path intended to look human in recordings.
+    #[default]
+    Natural,
+    /// A straight path with smooth acceleration and deceleration.
+    Smooth,
+    /// A single immediate cursor move.
+    Instant,
+}
+
+impl MotionProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::Smooth => "smooth",
+            Self::Instant => "instant",
+        }
+    }
+}
+
+impl ScrollDirection {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyModifier {
+    Ctrl,
+    Alt,
+    Shift,
+    Super,
+}
+
+impl KeyModifier {
+    pub fn wtype_name(&self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Alt => "alt",
+            Self::Shift => "shift",
+            Self::Super => "logo",
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Alt => "alt",
+            Self::Shift => "shift",
+            Self::Super => "super",
+        }
+    }
+}
+
 impl MouseButton {
     pub fn linux_code(&self) -> u32 {
         match self {

@@ -1,7 +1,10 @@
 use crate::{
     Harness,
-    harness::{ClickResult, CursorObservation, DesktopMetadata, MoveResult, WindowsObservation},
-    models::{MouseButton, Point},
+    harness::{
+        ClickResult, CursorObservation, DesktopMetadata, FocusResult, MoveResult, PressKeyResult,
+        ScrollResult, TypeTextResult, WaitResult, WindowsObservation,
+    },
+    models::{KeyModifier, MotionProfile, MouseButton, Point, ScrollDirection},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
@@ -14,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Always call observe_desktop before pointer actions. Coordinates are Hyprland global logical coordinates, not screenshot pixels; use the returned monitor geometry and scale. Re-observe after clicks or other visible state changes. Stop when a tool returns SESSION_LOCKED, OUT_OF_BOUNDS, RATE_LIMITED, INPUT_DISABLED, or INPUT_UNAVAILABLE. Never infer coordinates from a stale observation.";
+const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Observe before acting and re-observe after visible changes. Coordinates are Hyprland global logical coordinates, not image pixels. Use stableId from list_windows for focus_window and expected_window_id. Pointer movement is natural and distance-timed by default; use explicit 700-1000 ms natural moves to emphasize controls in recorded demos. Move the pointer over a scroll target before scrolling. Use wait after navigation or other asynchronous UI changes. Stop on safety errors and never infer coordinates from a stale observation.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ObserveParams {
@@ -28,10 +31,12 @@ pub struct MoveParams {
     pub x: i32,
     /// Global logical Y coordinate.
     pub y: i32,
-    /// Smooth movement duration in milliseconds, from 0 through 2000.
+    /// Movement duration in milliseconds, from 0 through 3000. Omit for distance-aware timing; 0 moves instantly.
+    #[schemars(range(min = 0, max = 3000))]
+    pub duration_ms: Option<u32>,
+    /// Path style. Natural is subtly curved, smooth is straight and eased, and instant teleports.
     #[serde(default)]
-    #[schemars(range(min = 0, max = 2000))]
-    pub duration_ms: u32,
+    pub motion: MotionProfile,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -49,6 +54,56 @@ pub struct ClickParams {
     pub interval_ms: u32,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FocusWindowParams {
+    /// Exact stableId or address returned by list_windows.
+    pub window_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScrollParams {
+    /// Direction to scroll at the current pointer position.
+    pub direction: ScrollDirection,
+    /// Number of discrete wheel steps, from 1 through 20.
+    #[serde(default = "default_scroll_amount")]
+    #[schemars(range(min = 1, max = 20))]
+    pub amount: u8,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PressKeyParams {
+    /// Letter, digit, F1-F12, or documented named key such as enter, tab, escape, left, or page_down.
+    pub key: String,
+    /// Modifiers held while pressing the key.
+    #[serde(default)]
+    pub modifiers: Vec<KeyModifier>,
+    /// Number of key presses, from 1 through 20.
+    #[serde(default = "default_count")]
+    #[schemars(range(min = 1, max = 20))]
+    pub repeat: u8,
+    /// Optional stableId/address that must currently be focused, guarding against stale focus.
+    pub expected_window_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TypeTextParams {
+    /// UTF-8 text to type. The text itself is never written to the audit log.
+    pub text: String,
+    /// Delay between characters in milliseconds, from 0 through 50.
+    #[serde(default = "default_text_interval")]
+    #[schemars(range(min = 0, max = 50))]
+    pub interval_ms: u32,
+    /// Optional stableId/address that must currently be focused, guarding against stale focus.
+    pub expected_window_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitParams {
+    /// Time to wait in milliseconds, from 0 through 30000.
+    #[schemars(range(min = 0, max = 30000))]
+    pub duration_ms: u32,
+}
+
 fn default_button() -> MouseButton {
     MouseButton::Left
 }
@@ -59,6 +114,14 @@ fn default_count() -> u8 {
 
 fn default_interval() -> u32 {
     120
+}
+
+fn default_scroll_amount() -> u8 {
+    3
+}
+
+fn default_text_interval() -> u32 {
+    5
 }
 
 #[derive(Clone, Debug)]
@@ -130,7 +193,7 @@ impl HyprHarnessMcp {
     }
 
     #[tool(
-        description = "Move the pointer to an enabled monitor position using Hyprland global logical coordinates. Optionally animate the movement.",
+        description = "Move the pointer to an enabled monitor position in global logical coordinates. Defaults to a natural, distance-timed, subtly curved motion suitable for demos; use smooth for a straight eased path or instant for a teleport.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<MoveResult>(),
         annotations(
             title = "Move pointer",
@@ -149,6 +212,7 @@ impl HyprHarnessMcp {
                         y: params.y,
                     },
                     params.duration_ms,
+                    params.motion,
                 )
                 .await,
         )
@@ -171,6 +235,97 @@ impl HyprHarnessMcp {
                 .click(params.button, params.count, params.interval_ms)
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Focus a mapped Hyprland window by the exact stableId or address returned from list_windows.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<FocusResult>(),
+        annotations(
+            title = "Focus window",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn focus_window(
+        &self,
+        Parameters(params): Parameters<FocusWindowParams>,
+    ) -> CallToolResult {
+        structured(self.harness.focus_window(params.window_id).await)
+    }
+
+    #[tool(
+        description = "Scroll at the current pointer position using discrete wheel steps. Move the pointer over the intended scrollable surface first.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<ScrollResult>(),
+        annotations(
+            title = "Scroll",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> CallToolResult {
+        structured(self.harness.scroll(params.direction, params.amount).await)
+    }
+
+    #[tool(
+        description = "Press a validated key or shortcut in the focused window. Supply expected_window_id for race-safe input.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<PressKeyResult>(),
+        annotations(
+            title = "Press key",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn press_key(&self, Parameters(params): Parameters<PressKeyParams>) -> CallToolResult {
+        structured(
+            self.harness
+                .press_key(
+                    params.key,
+                    params.modifiers,
+                    params.repeat,
+                    params.expected_window_id,
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Type validated UTF-8 text into the focused window through Wayland. Supply expected_window_id for race-safe input; text content is redacted from audit logs.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<TypeTextResult>(),
+        annotations(
+            title = "Type text",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn type_text(&self, Parameters(params): Parameters<TypeTextParams>) -> CallToolResult {
+        structured(
+            self.harness
+                .type_text(params.text, params.interval_ms, params.expected_window_id)
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Wait for a bounded duration so an application can finish navigation, animation, or asynchronous work before observing again.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<WaitResult>(),
+        annotations(
+            title = "Wait",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn wait(&self, Parameters(params): Parameters<WaitParams>) -> CallToolResult {
+        structured(self.harness.wait(params.duration_ms).await)
     }
 }
 
@@ -243,6 +398,11 @@ mod tests {
             HyprHarnessMcp::list_windows_tool_attr(),
             HyprHarnessMcp::move_pointer_tool_attr(),
             HyprHarnessMcp::click_tool_attr(),
+            HyprHarnessMcp::focus_window_tool_attr(),
+            HyprHarnessMcp::scroll_tool_attr(),
+            HyprHarnessMcp::press_key_tool_attr(),
+            HyprHarnessMcp::type_text_tool_attr(),
+            HyprHarnessMcp::wait_tool_attr(),
         ];
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(
@@ -252,7 +412,12 @@ mod tests {
                 "get_cursor",
                 "list_windows",
                 "move_pointer",
-                "click"
+                "click",
+                "focus_window",
+                "scroll",
+                "press_key",
+                "type_text",
+                "wait"
             ]
         );
         assert_eq!(
@@ -266,8 +431,17 @@ mod tests {
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
         assert_eq!(
             tools[3].input_schema["properties"]["duration_ms"]["maximum"],
-            2000
+            3000
+        );
+        assert_eq!(
+            tools[3].input_schema["properties"]["motion"]["default"],
+            "natural"
         );
         assert_eq!(tools[4].input_schema["properties"]["count"]["maximum"], 3);
+        assert_eq!(tools[6].input_schema["properties"]["amount"]["maximum"], 20);
+        assert_eq!(
+            tools[9].input_schema["properties"]["duration_ms"]["maximum"],
+            30_000
+        );
     }
 }

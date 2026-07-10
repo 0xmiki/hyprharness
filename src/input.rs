@@ -1,6 +1,6 @@
 use crate::{
     error::{HarnessError, Result},
-    models::MouseButton,
+    models::{MouseButton, ScrollDirection},
 };
 use async_trait::async_trait;
 use std::{
@@ -22,6 +22,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 #[async_trait]
 pub trait PointerApi: Send + Sync {
     async fn click(&self, button: MouseButton, count: u8, interval: Duration) -> Result<()>;
+    async fn scroll(&self, direction: ScrollDirection, amount: u8) -> Result<()>;
     async fn probe(&self) -> Result<()>;
 }
 
@@ -30,6 +31,11 @@ enum Command {
         button: MouseButton,
         count: u8,
         interval: Duration,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Scroll {
+        direction: ScrollDirection,
+        amount: u8,
         reply: oneshot::Sender<Result<()>>,
     },
     Probe {
@@ -80,6 +86,19 @@ impl PointerApi for VirtualPointerActor {
                 button,
                 count,
                 interval,
+                reply,
+            },
+            receiver,
+        )
+        .await
+    }
+
+    async fn scroll(&self, direction: ScrollDirection, amount: u8) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(
+            Command::Scroll {
+                direction,
+                amount,
                 reply,
             },
             receiver,
@@ -158,6 +177,26 @@ impl WaylandPointer {
             .and_then(|_| self.connection.roundtrip().map(|_| ()))
             .map_err(|e| HarnessError::io("INPUT_UNAVAILABLE", "send pointer button", e))
     }
+
+    fn scroll(&self, direction: ScrollDirection, amount: u8) -> Result<()> {
+        let (axis, sign) = match direction {
+            ScrollDirection::Up => (wl_pointer::Axis::VerticalScroll, -1.0),
+            ScrollDirection::Down => (wl_pointer::Axis::VerticalScroll, 1.0),
+            ScrollDirection::Left => (wl_pointer::Axis::HorizontalScroll, -1.0),
+            ScrollDirection::Right => (wl_pointer::Axis::HorizontalScroll, 1.0),
+        };
+        let time = self.started.elapsed().as_millis() as u32;
+        let discrete = sign as i32 * i32::from(amount);
+        let value = sign * f64::from(amount) * 15.0;
+        self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+        self.pointer.axis(time, axis, value);
+        self.pointer.axis_discrete(time, axis, value, discrete);
+        self.pointer.frame();
+        self.connection
+            .flush()
+            .and_then(|_| self.connection.roundtrip().map(|_| ()))
+            .map_err(|e| HarnessError::io("INPUT_UNAVAILABLE", "send pointer scroll", e))
+    }
 }
 
 fn run_actor(receiver: Receiver<Command>) {
@@ -172,9 +211,15 @@ fn run_actor(receiver: Receiver<Command>) {
                 ..
             } => ensure_pointer(&mut pointer)
                 .and_then(|pointer| pointer.click(button.clone(), *count, *interval)),
+            Command::Scroll {
+                direction, amount, ..
+            } => ensure_pointer(&mut pointer)
+                .and_then(|pointer| pointer.scroll(direction.clone(), *amount)),
         };
         match command {
-            Command::Probe { reply } | Command::Click { reply, .. } => {
+            Command::Probe { reply }
+            | Command::Click { reply, .. }
+            | Command::Scroll { reply, .. } => {
                 let _ = reply.send(result);
             }
         }

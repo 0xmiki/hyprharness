@@ -11,12 +11,18 @@ use std::{
 const WINDOW: Duration = Duration::from_secs(60);
 const MOVE_LIMIT: usize = 300;
 const CLICK_LIMIT: usize = 60;
+const FOCUS_LIMIT: usize = 120;
+const SCROLL_LIMIT: usize = 240;
+const KEYBOARD_LIMIT: usize = 2_000;
 
 #[derive(Debug)]
 pub struct SafetyPolicy {
     read_only: bool,
     moves: Mutex<VecDeque<Instant>>,
     clicks: Mutex<VecDeque<Instant>>,
+    focuses: Mutex<VecDeque<Instant>>,
+    scrolls: Mutex<VecDeque<Instant>>,
+    keyboard: Mutex<VecDeque<Instant>>,
 }
 
 impl SafetyPolicy {
@@ -25,6 +31,9 @@ impl SafetyPolicy {
             read_only,
             moves: Mutex::new(VecDeque::new()),
             clicks: Mutex::new(VecDeque::new()),
+            focuses: Mutex::new(VecDeque::new()),
+            scrolls: Mutex::new(VecDeque::new()),
+            keyboard: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -61,11 +70,26 @@ impl SafetyPolicy {
         register(&self.clicks, count, CLICK_LIMIT, "click")
     }
 
+    pub fn allow_focus(&self) -> Result<()> {
+        self.ensure_input_enabled()?;
+        register(&self.focuses, 1, FOCUS_LIMIT, "focus_window")
+    }
+
+    pub fn allow_scroll(&self, amount: usize) -> Result<()> {
+        self.ensure_input_enabled()?;
+        register(&self.scrolls, amount, SCROLL_LIMIT, "scroll")
+    }
+
+    pub fn allow_keyboard(&self, events: usize, tool: &str) -> Result<()> {
+        self.ensure_input_enabled()?;
+        register(&self.keyboard, events, KEYBOARD_LIMIT, tool)
+    }
+
     fn ensure_input_enabled(&self) -> Result<()> {
         if self.read_only {
             Err(HarnessError::new(
                 "INPUT_DISABLED",
-                "pointer input is disabled by --read-only",
+                "desktop input is disabled by --read-only",
             ))
         } else {
             Ok(())
