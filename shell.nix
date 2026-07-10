@@ -8,8 +8,11 @@ pkgs.mkShell {
     rustfmt
     clippy
 
-    # Useful development tools
+    # Native Wayland support and screenshot capture
     pkg-config
+    wayland
+    wayland-protocols
+    grim
   ];
 
   env = {
@@ -18,8 +21,8 @@ pkgs.mkShell {
   };
 
   shellHook = ''
-    echo "🦀 hyprharness development shell"
-    echo "Rust: $(rustc --version)"
-    echo "Cargo: $(cargo --version)"
+    echo "🦀 hyprharness development shell" >&2
+    echo "Rust: $(rustc --version)" >&2
+    echo "Cargo: $(cargo --version)" >&2
   '';
 }
