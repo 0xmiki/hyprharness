@@ -2,9 +2,11 @@ use crate::{
     Harness,
     harness::{
         ClickResult, CursorObservation, DesktopMetadata, FocusResult, MoveResult, PressKeyResult,
-        ScrollResult, TypeTextResult, WaitResult, WindowsObservation,
+        ScrollResult, SequenceExecution, SequenceRun, TypeTextResult, WaitResult,
+        WindowsObservation, WorkspaceResult,
     },
     models::{KeyModifier, MotionProfile, MouseButton, Point, ScrollDirection},
+    sequence::SequenceStep,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
@@ -17,7 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Observe before acting and re-observe after visible changes. Coordinates are Hyprland global logical coordinates, not image pixels. Use stableId from list_windows for focus_window and expected_window_id. Pointer movement is natural and distance-timed by default; use explicit 700-1000 ms natural moves to emphasize controls in recorded demos. Move the pointer over a scroll target before scrolling. Use wait after navigation or other asynchronous UI changes. Stop on safety errors and never infer coordinates from a stale observation.";
+const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Observe before acting and re-observe after visible changes. Coordinates are Hyprland global logical coordinates, not image pixels. Use stableId from list_windows for focus_window and input guards. Pointer movement is natural and distance-timed by default; use explicit 700-1000 ms natural moves to emphasize controls in recorded demos. Use run_sequence only for deterministic choreography that does not require reasoning between steps; use individual calls whenever an intermediate screen must be inspected. Move the pointer over a scroll target before scrolling. Stop on safety errors and never infer coordinates from a stale observation.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ObserveParams {
@@ -102,6 +104,25 @@ pub struct WaitParams {
     /// Time to wait in milliseconds, from 0 through 30000.
     #[schemars(range(min = 0, max = 30000))]
     pub duration_ms: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SwitchWorkspaceParams {
+    /// Positive numeric Hyprland workspace ID to focus.
+    #[schemars(range(min = 1))]
+    pub workspace_id: i32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunSequenceParams {
+    /// Ordered, typed actions. The server validates the complete plan before starting.
+    #[schemars(length(min = 1, max = 32))]
+    pub steps: Vec<SequenceStep>,
+    /// Capture and return the final desktop after all steps succeed.
+    #[serde(default)]
+    pub observe_at_end: bool,
+    /// Monitor to capture at the end. Requires observe_at_end; omit for the focused monitor.
+    pub final_monitor: Option<String>,
 }
 
 fn default_button() -> MouseButton {
@@ -327,6 +348,49 @@ impl HyprHarnessMcp {
     async fn wait(&self, Parameters(params): Parameters<WaitParams>) -> CallToolResult {
         structured(self.harness.wait(params.duration_ms).await)
     }
+
+    #[tool(
+        description = "Focus a positive numeric Hyprland workspace through compositor IPC and verify the resulting focused monitor/workspace.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<WorkspaceResult>(),
+        annotations(
+            title = "Switch workspace",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn switch_workspace(
+        &self,
+        Parameters(params): Parameters<SwitchWorkspaceParams>,
+    ) -> CallToolResult {
+        structured(self.harness.switch_workspace(params.workspace_id).await)
+    }
+
+    #[tool(
+        description = "Execute 1-32 typed desktop actions serially as one fail-fast choreography. Plans are limited to 45 seconds, waits to 10 seconds each, input cannot interleave, per-step guards are checked live, and an optional final screenshot can be returned. Use only when no intermediate visual reasoning is required.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<SequenceExecution>(),
+        annotations(
+            title = "Run action sequence",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn run_sequence(
+        &self,
+        Parameters(params): Parameters<RunSequenceParams>,
+    ) -> CallToolResult {
+        match self
+            .harness
+            .run_sequence(params.steps, params.observe_at_end, params.final_monitor)
+            .await
+        {
+            Ok(run) => sequence_result(run),
+            Err(error) => tool_error(error),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -382,6 +446,24 @@ fn result_with_image(metadata: DesktopMetadata, png: Vec<u8>) -> CallToolResult 
     }
 }
 
+fn sequence_result(run: SequenceRun) -> CallToolResult {
+    match serde_json::to_value(run.execution) {
+        Ok(value) => {
+            let mut result = CallToolResult::structured(value);
+            if let Some(png) = run.png {
+                result
+                    .content
+                    .insert(0, ContentBlock::image(STANDARD.encode(png), "image/png"));
+            }
+            result
+        }
+        Err(error) => CallToolResult::structured_error(json!({
+            "ok": false,
+            "error": {"code": "INTERNAL_ERROR", "message": error.to_string()}
+        })),
+    }
+}
+
 fn tool_error(error: crate::HarnessError) -> CallToolResult {
     CallToolResult::structured_error(error.as_json())
 }
@@ -403,6 +485,8 @@ mod tests {
             HyprHarnessMcp::press_key_tool_attr(),
             HyprHarnessMcp::type_text_tool_attr(),
             HyprHarnessMcp::wait_tool_attr(),
+            HyprHarnessMcp::switch_workspace_tool_attr(),
+            HyprHarnessMcp::run_sequence_tool_attr(),
         ];
         let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(
@@ -417,7 +501,9 @@ mod tests {
                 "scroll",
                 "press_key",
                 "type_text",
-                "wait"
+                "wait",
+                "switch_workspace",
+                "run_sequence"
             ]
         );
         assert_eq!(
@@ -442,6 +528,14 @@ mod tests {
         assert_eq!(
             tools[9].input_schema["properties"]["duration_ms"]["maximum"],
             30_000
+        );
+        assert_eq!(
+            tools[11].input_schema["properties"]["steps"]["maxItems"],
+            32
+        );
+        assert_eq!(
+            tools[11].annotations.as_ref().unwrap().destructive_hint,
+            Some(true)
         );
     }
 }

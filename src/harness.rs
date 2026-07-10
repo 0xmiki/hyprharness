@@ -7,6 +7,10 @@ use crate::{
     keyboard::{KeyboardApi, WtypeKeyboard, normalize_key},
     models::{KeyModifier, Monitor, MotionProfile, MouseButton, Point, ScrollDirection, Window},
     policy::SafetyPolicy,
+    sequence::{
+        MAX_SEQUENCE_DURATION_MS, MAX_SEQUENCE_STEPS, MAX_SEQUENCE_WAIT_MS, SequenceAction,
+        SequenceGuard, SequenceStep, SequenceStepError, SequenceStepResult,
+    },
 };
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -14,8 +18,19 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct AuditContext {
+    sequence_id: Uuid,
+    step_index: Option<usize>,
+}
+
+tokio::task_local! {
+    static AUDIT_CONTEXT: AuditContext;
+}
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CursorObservation {
@@ -123,6 +138,32 @@ pub struct WaitResult {
     pub elapsed_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct WorkspaceResult {
+    pub previous_workspace: crate::models::WorkspaceRef,
+    pub workspace: crate::models::WorkspaceRef,
+    pub monitor: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SequenceExecution {
+    pub sequence_id: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub elapsed_ms: u128,
+    pub completed_steps: usize,
+    pub steps: Vec<SequenceStepResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_observation: Option<DesktopMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceRun {
+    pub execution: SequenceExecution,
+    pub png: Option<Vec<u8>>,
+}
+
 #[derive(Clone)]
 pub struct Harness {
     ipc: Arc<dyn HyprlandApi>,
@@ -131,6 +172,7 @@ pub struct Harness {
     keyboard: Arc<dyn KeyboardApi>,
     policy: Arc<SafetyPolicy>,
     audit: Arc<AuditLogger>,
+    action_lock: Arc<AsyncMutex<()>>,
     session_id: Uuid,
 }
 
@@ -171,6 +213,7 @@ impl Harness {
             keyboard,
             policy,
             audit,
+            action_lock: Arc::new(AsyncMutex::new(())),
             session_id: Uuid::new_v4(),
         }
     }
@@ -289,6 +332,17 @@ impl Harness {
         requested_duration_ms: Option<u32>,
         motion: MotionProfile,
     ) -> Result<MoveResult> {
+        let _guard = self.action_lock.lock().await;
+        self.move_pointer_inner(target, requested_duration_ms, motion)
+            .await
+    }
+
+    async fn move_pointer_inner(
+        &self,
+        target: Point,
+        requested_duration_ms: Option<u32>,
+        motion: MotionProfile,
+    ) -> Result<MoveResult> {
         let started = Instant::now();
         let before = self.ipc.cursor().await.ok();
         self.audit.ensure_writable()?;
@@ -362,6 +416,16 @@ impl Harness {
         count: u8,
         interval_ms: u32,
     ) -> Result<ClickResult> {
+        let _guard = self.action_lock.lock().await;
+        self.click_inner(button, count, interval_ms).await
+    }
+
+    async fn click_inner(
+        &self,
+        button: MouseButton,
+        count: u8,
+        interval_ms: u32,
+    ) -> Result<ClickResult> {
         let started = Instant::now();
         let before = self.ipc.cursor().await.ok();
         self.audit.ensure_writable()?;
@@ -408,6 +472,11 @@ impl Harness {
     }
 
     pub async fn focus_window(&self, window_id: String) -> Result<FocusResult> {
+        let _guard = self.action_lock.lock().await;
+        self.focus_window_inner(window_id).await
+    }
+
+    async fn focus_window_inner(&self, window_id: String) -> Result<FocusResult> {
         let started = Instant::now();
         self.audit.ensure_writable()?;
         let result = async {
@@ -446,6 +515,11 @@ impl Harness {
     }
 
     pub async fn scroll(&self, direction: ScrollDirection, amount: u8) -> Result<ScrollResult> {
+        let _guard = self.action_lock.lock().await;
+        self.scroll_inner(direction, amount).await
+    }
+
+    async fn scroll_inner(&self, direction: ScrollDirection, amount: u8) -> Result<ScrollResult> {
         let started = Instant::now();
         let before = self.ipc.cursor().await.ok();
         self.audit.ensure_writable()?;
@@ -480,6 +554,18 @@ impl Harness {
     }
 
     pub async fn press_key(
+        &self,
+        key: String,
+        modifiers: Vec<KeyModifier>,
+        repeat: u8,
+        expected_window_id: Option<String>,
+    ) -> Result<PressKeyResult> {
+        let _guard = self.action_lock.lock().await;
+        self.press_key_inner(key, modifiers, repeat, expected_window_id)
+            .await
+    }
+
+    async fn press_key_inner(
         &self,
         key: String,
         modifiers: Vec<KeyModifier>,
@@ -541,6 +627,17 @@ impl Harness {
         interval_ms: u32,
         expected_window_id: Option<String>,
     ) -> Result<TypeTextResult> {
+        let _guard = self.action_lock.lock().await;
+        self.type_text_inner(text, interval_ms, expected_window_id)
+            .await
+    }
+
+    async fn type_text_inner(
+        &self,
+        text: String,
+        interval_ms: u32,
+        expected_window_id: Option<String>,
+    ) -> Result<TypeTextResult> {
         let started = Instant::now();
         self.audit.ensure_writable()?;
         let characters = text.chars().count();
@@ -589,6 +686,63 @@ impl Harness {
         result
     }
 
+    pub async fn switch_workspace(&self, workspace_id: i32) -> Result<WorkspaceResult> {
+        let _guard = self.action_lock.lock().await;
+        self.switch_workspace_inner(workspace_id).await
+    }
+
+    async fn switch_workspace_inner(&self, workspace_id: i32) -> Result<WorkspaceResult> {
+        let started = Instant::now();
+        self.audit.ensure_writable()?;
+        let result = async {
+            if workspace_id < 1 {
+                return Err(HarnessError::invalid("workspace_id must be at least 1"));
+            }
+            self.deny_if_locked().await?;
+            self.policy.allow_workspace()?;
+            let monitors = self.ipc.monitors().await?;
+            let previous_workspace = monitors
+                .iter()
+                .find(|monitor| monitor.focused)
+                .map(|monitor| monitor.active_workspace.clone())
+                .ok_or_else(|| {
+                    HarnessError::new(
+                        "NO_FOCUSED_MONITOR",
+                        "no focused monitor was found before switching workspace",
+                    )
+                })?;
+            self.ipc.focus_workspace(workspace_id).await?;
+            let monitors = self.ipc.monitors().await?;
+            let monitor = monitors
+                .iter()
+                .find(|monitor| {
+                    monitor.focused && monitor.active_workspace.id == i64::from(workspace_id)
+                })
+                .ok_or_else(|| {
+                    HarnessError::new(
+                        "WORKSPACE_SWITCH_FAILED",
+                        format!("Hyprland did not focus workspace {workspace_id}"),
+                    )
+                })?;
+            Ok(WorkspaceResult {
+                previous_workspace,
+                workspace: monitor.active_workspace.clone(),
+                monitor: monitor.name.clone(),
+            })
+        }
+        .await;
+        self.finish_audit(
+            "switch_workspace",
+            json!({"workspace_id": workspace_id}),
+            started,
+            &result,
+            None,
+            None,
+        )
+        .await?;
+        result
+    }
+
     pub async fn wait(&self, duration_ms: u32) -> Result<WaitResult> {
         let started = Instant::now();
         let result = async {
@@ -614,6 +768,367 @@ impl Harness {
         )
         .await?;
         result
+    }
+
+    pub async fn run_sequence(
+        &self,
+        steps: Vec<SequenceStep>,
+        observe_at_end: bool,
+        final_monitor: Option<String>,
+    ) -> Result<SequenceRun> {
+        let _action_guard = self.action_lock.lock().await;
+        let started = Instant::now();
+        let started_at = Utc::now();
+        let sequence_id = Uuid::new_v4();
+        let audit_arguments = sequence_audit_arguments(
+            sequence_id,
+            &steps,
+            observe_at_end,
+            final_monitor.as_deref(),
+        );
+        self.audit.ensure_writable()?;
+        let result = async {
+            self.validate_sequence_plan(&steps, observe_at_end, final_monitor.as_deref())
+                .await?;
+            let mut step_results = Vec::with_capacity(steps.len());
+            let total_steps = steps.len();
+
+            for (index, step) in steps.into_iter().enumerate() {
+                let action_name = step.action.name().to_string();
+                let step_started = Instant::now();
+                let started_offset_ms = started.elapsed().as_millis();
+                let context = AuditContext {
+                    sequence_id,
+                    step_index: Some(index),
+                };
+                let step_result = AUDIT_CONTEXT
+                    .scope(context, async {
+                        self.validate_sequence_guard(&step.guard).await?;
+                        self.execute_sequence_action(step.action, &step.guard).await
+                    })
+                    .await;
+                match step_result {
+                    Ok(value) => step_results.push(SequenceStepResult {
+                        index,
+                        action: action_name,
+                        started_offset_ms,
+                        elapsed_ms: step_started.elapsed().as_millis(),
+                        ok: true,
+                        result: Some(value),
+                        error: None,
+                    }),
+                    Err(error) => {
+                        step_results.push(SequenceStepResult {
+                            index,
+                            action: action_name,
+                            started_offset_ms,
+                            elapsed_ms: step_started.elapsed().as_millis(),
+                            ok: false,
+                            result: None,
+                            error: Some(SequenceStepError {
+                                code: error.code.into(),
+                                message: error.message.clone(),
+                                details: error.details.clone(),
+                            }),
+                        });
+                        let execution = SequenceExecution {
+                            sequence_id: sequence_id.to_string(),
+                            status: "failed".into(),
+                            started_at,
+                            finished_at: Utc::now(),
+                            elapsed_ms: started.elapsed().as_millis(),
+                            completed_steps: index,
+                            steps: step_results,
+                            final_observation: None,
+                        };
+                        return Err(HarnessError::new(
+                            "SEQUENCE_FAILED",
+                            format!(
+                                "sequence stopped at step {index} of {total_steps}: {}",
+                                error.message
+                            ),
+                        )
+                        .with_details(json!({"sequence": execution})));
+                    }
+                }
+            }
+
+            let (final_observation, png) = if observe_at_end {
+                let context = AuditContext {
+                    sequence_id,
+                    step_index: None,
+                };
+                let observation_result = AUDIT_CONTEXT
+                    .scope(context, self.observe_desktop(final_monitor))
+                    .await;
+                let observation = match observation_result {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        let execution = SequenceExecution {
+                            sequence_id: sequence_id.to_string(),
+                            status: "failed".into(),
+                            started_at,
+                            finished_at: Utc::now(),
+                            elapsed_ms: started.elapsed().as_millis(),
+                            completed_steps: total_steps,
+                            steps: step_results,
+                            final_observation: None,
+                        };
+                        return Err(HarnessError::new(
+                            "SEQUENCE_FAILED",
+                            format!("all actions completed but final observation failed: {error}"),
+                        )
+                        .with_details(json!({"sequence": execution})));
+                    }
+                };
+                (Some(observation.metadata), Some(observation.png))
+            } else {
+                (None, None)
+            };
+            Ok(SequenceRun {
+                execution: SequenceExecution {
+                    sequence_id: sequence_id.to_string(),
+                    status: "completed".into(),
+                    started_at,
+                    finished_at: Utc::now(),
+                    elapsed_ms: started.elapsed().as_millis(),
+                    completed_steps: total_steps,
+                    steps: step_results,
+                    final_observation,
+                },
+                png,
+            })
+        }
+        .await;
+        self.finish_audit_with_context(
+            "run_sequence",
+            audit_arguments,
+            started,
+            &result,
+            None,
+            None,
+            Some(AuditContext {
+                sequence_id,
+                step_index: None,
+            }),
+        )
+        .await?;
+        result
+    }
+
+    async fn validate_sequence_plan(
+        &self,
+        steps: &[SequenceStep],
+        observe_at_end: bool,
+        final_monitor: Option<&str>,
+    ) -> Result<()> {
+        if steps.is_empty() || steps.len() > MAX_SEQUENCE_STEPS {
+            return Err(HarnessError::invalid(format!(
+                "steps must contain between 1 and {MAX_SEQUENCE_STEPS} actions"
+            )));
+        }
+        if final_monitor.is_some() && !observe_at_end {
+            return Err(HarnessError::invalid(
+                "final_monitor requires observe_at_end to be true",
+            ));
+        }
+        if self.read_only() && steps.iter().any(|step| step.action.is_input()) {
+            return Err(HarnessError::new(
+                "INPUT_DISABLED",
+                "desktop input is disabled by --read-only",
+            ));
+        }
+        let planned_duration_ms = steps.iter().try_fold(0_u64, |total, step| {
+            total
+                .checked_add(step.action.planned_duration_ms())
+                .ok_or_else(|| HarnessError::invalid("sequence duration overflowed"))
+        })?;
+        if planned_duration_ms > MAX_SEQUENCE_DURATION_MS {
+            return Err(HarnessError::invalid(format!(
+                "planned sequence duration must not exceed {MAX_SEQUENCE_DURATION_MS} ms"
+            )));
+        }
+
+        let monitors = self.ipc.monitors().await?;
+        if observe_at_end {
+            select_monitor(&monitors, final_monitor)?;
+        }
+        for (index, step) in steps.iter().enumerate() {
+            if step
+                .guard
+                .focused_window_id
+                .as_deref()
+                .is_some_and(str::is_empty)
+            {
+                return Err(HarnessError::invalid(format!(
+                    "step {index} guard focused_window_id cannot be empty"
+                )));
+            }
+            if step.guard.workspace_id.is_some_and(|id| id < 1) {
+                return Err(HarnessError::invalid(format!(
+                    "step {index} guard workspace_id must be at least 1"
+                )));
+            }
+            let invalid = |message: &str| {
+                HarnessError::invalid(format!("step {index} {}: {message}", step.action.name()))
+            };
+            match &step.action {
+                SequenceAction::MovePointer {
+                    x, y, duration_ms, ..
+                } => {
+                    if duration_ms.is_some_and(|duration| duration > 3_000) {
+                        return Err(invalid("duration_ms must be between 0 and 3000"));
+                    }
+                    self.policy
+                        .validate_target(&Point { x: *x, y: *y }, &monitors)
+                        .map_err(|error| invalid(&error.message))?;
+                }
+                SequenceAction::Click {
+                    count, interval_ms, ..
+                } => {
+                    if !(1..=3).contains(count) {
+                        return Err(invalid("count must be between 1 and 3"));
+                    }
+                    if !(40..=1_000).contains(interval_ms) {
+                        return Err(invalid("interval_ms must be between 40 and 1000"));
+                    }
+                }
+                SequenceAction::FocusWindow { window_id } if window_id.is_empty() => {
+                    return Err(invalid("window_id cannot be empty"));
+                }
+                SequenceAction::Scroll { amount, .. } if !(1..=20).contains(amount) => {
+                    return Err(invalid("amount must be between 1 and 20"));
+                }
+                SequenceAction::PressKey {
+                    key,
+                    modifiers,
+                    repeat,
+                } => {
+                    normalize_key(key).map_err(|error| invalid(&error.message))?;
+                    if !(1..=20).contains(repeat) {
+                        return Err(invalid("repeat must be between 1 and 20"));
+                    }
+                    if has_duplicate_modifiers(modifiers) {
+                        return Err(invalid("modifiers cannot contain duplicates"));
+                    }
+                }
+                SequenceAction::TypeText {
+                    text, interval_ms, ..
+                } => {
+                    let characters = text.chars().count();
+                    if characters == 0 || characters > 2_000 || text.len() > 8_192 {
+                        return Err(invalid(
+                            "text must contain 1-2000 characters and at most 8192 UTF-8 bytes",
+                        ));
+                    }
+                    if *interval_ms > 50 {
+                        return Err(invalid("interval_ms must be between 0 and 50"));
+                    }
+                    if characters.saturating_mul(*interval_ms as usize) > 30_000 {
+                        return Err(invalid(
+                            "text length multiplied by interval_ms cannot exceed 30000 ms",
+                        ));
+                    }
+                }
+                SequenceAction::Wait { duration_ms } if *duration_ms > MAX_SEQUENCE_WAIT_MS => {
+                    return Err(invalid(&format!(
+                        "duration_ms must be between 0 and {MAX_SEQUENCE_WAIT_MS}"
+                    )));
+                }
+                SequenceAction::SwitchWorkspace { workspace_id } if *workspace_id < 1 => {
+                    return Err(invalid("workspace_id must be at least 1"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_sequence_guard(&self, guard: &SequenceGuard) -> Result<()> {
+        if let Some(window_id) = guard.focused_window_id.as_deref() {
+            let windows = self.ipc.windows().await?;
+            let expected = resolve_window(&windows, window_id)?;
+            let focused = windows.iter().find(|window| window.focused);
+            if focused.map(|window| window.address.as_str()) != Some(expected.address.as_str()) {
+                return Err(HarnessError::new(
+                    "SEQUENCE_GUARD_FAILED",
+                    format!("expected window '{window_id}' to be focused"),
+                )
+                .with_details(json!({
+                    "expected_window_id": window_id,
+                    "actual_window_id": focused.map(|window| &window.stable_id),
+                })));
+            }
+        }
+        if let Some(workspace_id) = guard.workspace_id {
+            let monitors = self.ipc.monitors().await?;
+            let focused = monitors
+                .iter()
+                .find(|monitor| monitor.focused)
+                .ok_or_else(|| {
+                    HarnessError::new("NO_FOCUSED_MONITOR", "no focused monitor was found")
+                })?;
+            if focused.active_workspace.id != i64::from(workspace_id) {
+                return Err(HarnessError::new(
+                    "SEQUENCE_GUARD_FAILED",
+                    format!("expected workspace {workspace_id} on the focused monitor"),
+                )
+                .with_details(json!({
+                    "expected_workspace_id": workspace_id,
+                    "actual_workspace_id": focused.active_workspace.id,
+                    "monitor": focused.name,
+                })));
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_sequence_action(
+        &self,
+        action: SequenceAction,
+        guard: &SequenceGuard,
+    ) -> Result<Value> {
+        let result = match action {
+            SequenceAction::MovePointer {
+                x,
+                y,
+                duration_ms,
+                motion,
+            } => serde_json::to_value(
+                self.move_pointer_inner(Point { x, y }, duration_ms, motion)
+                    .await?,
+            ),
+            SequenceAction::Click {
+                button,
+                count,
+                interval_ms,
+            } => serde_json::to_value(self.click_inner(button, count, interval_ms).await?),
+            SequenceAction::FocusWindow { window_id } => {
+                serde_json::to_value(self.focus_window_inner(window_id).await?)
+            }
+            SequenceAction::Scroll { direction, amount } => {
+                serde_json::to_value(self.scroll_inner(direction, amount).await?)
+            }
+            SequenceAction::PressKey {
+                key,
+                modifiers,
+                repeat,
+            } => serde_json::to_value(
+                self.press_key_inner(key, modifiers, repeat, guard.focused_window_id.clone())
+                    .await?,
+            ),
+            SequenceAction::TypeText { text, interval_ms } => serde_json::to_value(
+                self.type_text_inner(text, interval_ms, guard.focused_window_id.clone())
+                    .await?,
+            ),
+            SequenceAction::Wait { duration_ms } => {
+                serde_json::to_value(self.wait(duration_ms).await?)
+            }
+            SequenceAction::SwitchWorkspace { workspace_id } => {
+                serde_json::to_value(self.switch_workspace_inner(workspace_id).await?)
+            }
+        };
+        result.map_err(|error| HarnessError::io("INTERNAL_ERROR", "serialize step result", error))
     }
 
     async fn validate_keyboard_target(&self, expected_window_id: Option<&str>) -> Result<Window> {
@@ -666,6 +1181,29 @@ impl Harness {
         cursor_before: Option<Point>,
         cursor_after: Option<Point>,
     ) -> Result<()> {
+        self.finish_audit_with_context(
+            tool,
+            arguments,
+            started,
+            result,
+            cursor_before,
+            cursor_after,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_audit_with_context<T>(
+        &self,
+        tool: &str,
+        arguments: Value,
+        started: Instant,
+        result: &Result<T>,
+        cursor_before: Option<Point>,
+        cursor_after: Option<Point>,
+        explicit_context: Option<AuditContext>,
+    ) -> Result<()> {
         let active_window = self
             .ipc
             .windows()
@@ -673,10 +1211,13 @@ impl Harness {
             .ok()
             .and_then(|windows| windows.into_iter().find(|window| window.focused))
             .map(|window| window.address);
+        let context = explicit_context.or_else(|| AUDIT_CONTEXT.try_with(Clone::clone).ok());
         self.audit.record(&AuditRecord {
             timestamp: Utc::now(),
             session_id: self.session_id,
             request_id: Uuid::new_v4(),
+            sequence_id: context.as_ref().map(|context| context.sequence_id),
+            step_index: context.and_then(|context| context.step_index),
             tool: tool.into(),
             arguments,
             active_window,
@@ -687,6 +1228,36 @@ impl Harness {
             error_code: result.as_ref().err().map(|error| error.code.into()),
         })
     }
+}
+
+fn sequence_audit_arguments(
+    sequence_id: Uuid,
+    steps: &[SequenceStep],
+    observe_at_end: bool,
+    final_monitor: Option<&str>,
+) -> Value {
+    let steps: Vec<Value> = steps
+        .iter()
+        .map(|step| match &step.action {
+            SequenceAction::TypeText { text, interval_ms } => json!({
+                "action": "type_text",
+                "characters": text.chars().count(),
+                "bytes": text.len(),
+                "sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+                "interval_ms": interval_ms,
+                "guard": step.guard,
+            }),
+            _ => serde_json::to_value(step).unwrap_or_else(
+                |_| json!({"action": step.action.name(), "serialization_failed": true}),
+            ),
+        })
+        .collect();
+    json!({
+        "sequence_id": sequence_id,
+        "steps": steps,
+        "observe_at_end": observe_at_end,
+        "final_monitor": final_monitor,
+    })
 }
 
 fn select_monitor<'a>(monitors: &'a [Monitor], requested: Option<&str>) -> Result<&'a Monitor> {
@@ -955,6 +1526,22 @@ mod tests {
                 - i64::from(point.y - origin.y) * i64::from(target.x - origin.x);
             cross.abs() <= 1_000
         }));
+    }
+
+    #[test]
+    fn sequence_parent_audit_redacts_typed_text() {
+        let steps = vec![SequenceStep {
+            action: SequenceAction::TypeText {
+                text: "super secret demo text".into(),
+                interval_ms: 5,
+            },
+            guard: SequenceGuard::default(),
+        }];
+        let value = sequence_audit_arguments(Uuid::nil(), &steps, false, None);
+        let encoded = value.to_string();
+        assert!(!encoded.contains("super secret demo text"));
+        assert_eq!(value["steps"][0]["characters"], 22);
+        assert!(value["steps"][0]["sha256"].as_str().unwrap().len() == 64);
     }
 
     #[test]

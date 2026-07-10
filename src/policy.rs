@@ -75,6 +75,11 @@ impl SafetyPolicy {
         register(&self.focuses, 1, FOCUS_LIMIT, "focus_window")
     }
 
+    pub fn allow_workspace(&self) -> Result<()> {
+        self.ensure_input_enabled()?;
+        register(&self.focuses, 1, FOCUS_LIMIT, "switch_workspace")
+    }
+
     pub fn allow_scroll(&self, amount: usize) -> Result<()> {
         self.ensure_input_enabled()?;
         register(&self.scrolls, amount, SCROLL_LIMIT, "scroll")

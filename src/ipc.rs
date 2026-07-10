@@ -21,6 +21,7 @@ pub trait HyprlandApi: Send + Sync {
     async fn locked(&self) -> Result<bool>;
     async fn move_cursor(&self, point: Point) -> Result<()>;
     async fn focus_window(&self, address: &str) -> Result<()>;
+    async fn focus_workspace(&self, workspace_id: i32) -> Result<()>;
     async fn version(&self) -> Result<serde_json::Value>;
     async fn get_option(&self, name: &str) -> Result<serde_json::Value>;
 }
@@ -143,6 +144,10 @@ impl HyprlandApi for HyprlandIpc {
             .await
     }
 
+    async fn focus_workspace(&self, workspace_id: i32) -> Result<()> {
+        self.dispatch(&format!("workspace {workspace_id}")).await
+    }
+
     async fn version(&self) -> Result<serde_json::Value> {
         self.json("version").await
     }
@@ -189,6 +194,23 @@ mod tests {
             stream.write_all(b"ok").await.unwrap();
         });
         ipc.focus_window("0x1234").await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn focuses_a_numeric_workspace_without_shell_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let ipc = HyprlandIpc { socket_path: path };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"dispatch workspace 3");
+            stream.write_all(b"ok").await.unwrap();
+        });
+        ipc.focus_workspace(3).await.unwrap();
         server.await.unwrap();
     }
 }

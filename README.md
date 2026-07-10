@@ -14,6 +14,8 @@ The server exposes a complete observe/focus/input loop:
 - `press_key`
 - `type_text`
 - `wait`
+- `switch_workspace`
+- `run_sequence`
 
 It also includes `doctor`, `observe`, `test-pointer`, and `permissions` commands for human diagnostics.
 
@@ -62,7 +64,7 @@ codex mcp add hyprharness \
 codex mcp list
 ```
 
-Use `/mcp` inside a newly started Codex session to confirm that all ten tools are available. Codex launches the stdio server itself; do not run `hyprharness mcp` in a separate terminal. `Auth: Unsupported` is expected for a local stdio server.
+Use `/mcp` inside a newly started Codex session to confirm that all twelve tools are available. Codex launches the stdio server itself; do not run `hyprharness mcp` in a separate terminal. `Auth: Unsupported` is expected for a local stdio server.
 
 For unattended local demos, the equivalent `config.toml` entry is:
 
@@ -94,6 +96,12 @@ approval_mode = "approve"
 
 [mcp_servers.hyprharness.tools.type_text]
 approval_mode = "approve"
+
+[mcp_servers.hyprharness.tools.switch_workspace]
+approval_mode = "approve"
+
+[mcp_servers.hyprharness.tools.run_sequence]
+approval_mode = "approve"
 ```
 
 Put this in `~/.codex/config.toml`, or in a trusted project's `.codex/config.toml`. Auto-approval is powerful: only enable it on a machine and session you are comfortable allowing Codex to operate.
@@ -112,6 +120,8 @@ Put this in `~/.codex/config.toml`, or in a trusted project's `.codex/config.tom
 | `press_key` | Press a validated key/shortcut in the focused window. |
 | `type_text` | Type bounded UTF-8 text with optional per-character delay. |
 | `wait` | Pause for bounded UI navigation or asynchronous work. |
+| `switch_workspace` | Focus a numeric Hyprland workspace through compositor IPC. |
+| `run_sequence` | Execute a guarded, fail-fast demo choreography without inter-step latency. |
 
 See [docs/tools.md](docs/tools.md) for complete inputs, outputs, key names, safety behavior, errors, and recommended agent workflows.
 
@@ -147,8 +157,32 @@ Input: `{ "button"?: "left"|"middle"|"right", "count"?: 1..3, "interval_ms"?: 40
 - `press_key`: `{ "key": string, "modifiers"?: ["ctrl"|"alt"|"shift"|"super"], "repeat"?: 1..20, "expected_window_id"?: string }`.
 - `type_text`: `{ "text": string, "interval_ms"?: 0..50, "expected_window_id"?: string }`. Supports UTF-8 through `wtype`.
 - `wait`: `{ "duration_ms": 0..30000 }`.
+- `switch_workspace`: `{ "workspace_id": integer >= 1 }`.
 
 For keyboard safety, first call `list_windows`, focus the intended `stableId`, then pass the same ID as `expected_window_id`. This rejects stale focus immediately before injection; it cannot prevent an external focus change that happens during a long typing operation.
+
+### Deterministic demo sequences
+
+`run_sequence` executes 1–32 typed actions serially while holding the server's action lock. It is intended for rehearsed demo segments that do not require Codex to inspect an intermediate screen before choosing the next action. Plans are limited to 45 seconds, individual sequence waits to 10 seconds, and execution always stops on the first error.
+
+```json
+{
+  "steps": [
+    { "action": "move_pointer", "x": 1450, "y": 180, "duration_ms": 900 },
+    { "action": "wait", "duration_ms": 250 },
+    {
+      "action": "click",
+      "button": "left",
+      "guard": { "focused_window_id": "180000b1", "workspace_id": 2 }
+    },
+    { "action": "wait", "duration_ms": 800 },
+    { "action": "switch_workspace", "workspace_id": 3 }
+  ],
+  "observe_at_end": true
+}
+```
+
+The complete plan is statically checked before execution and each optional guard is checked again immediately before its step. A final observation can return both PNG content and structured metadata. Use separate MCP calls when the next action depends on interpreting an intermediate observation.
 
 ## Safety
 
@@ -164,6 +198,8 @@ Regardless of Codex approval settings, the trusted server:
 - Rejects positions outside enabled, powered monitors.
 - Limits movement, click, focus, scroll, and keyboard event rates independently.
 - Validates button, click-count, scroll amount, key names, modifiers, repeats, text size, delays, and wait bounds.
+- Serializes all input actions so standalone calls cannot interleave with a running sequence.
+- Preflights sequence size/duration and stops choreography on the first failed live guard or action.
 - Optionally verifies the expected focused window immediately before keyboard injection.
 - Exposes no command, executable, or shell-string arguments.
 - Stops state-changing actions when the audit log is unavailable.
@@ -174,7 +210,7 @@ Terminate the `hyprharness` process or disable the MCP server in Codex as the im
 
 The default path is `$XDG_STATE_HOME/hyprharness/audit.jsonl`, falling back to `~/.local/state/hyprharness/audit.jsonl`. Override it with `mcp --audit-log PATH`.
 
-Records contain UTC timestamp, server/request IDs, tool, validated arguments, focused window address, before/after cursor positions, duration, success, and error code. Screenshot bytes are never logged—only monitor, dimensions, size, and hash. Typed text is also redacted: audit records contain only character/byte counts, delay, and SHA-256. Files use mode `0600`, rotate at 10 MiB, and retain five archives.
+Records contain UTC timestamp, server/request IDs, tool, validated arguments, focused window address, before/after cursor positions, duration, success, and error code. Sequence parent/child records share a `sequence_id`, and child actions include `step_index`. Screenshot bytes are never logged—only monitor, dimensions, size, and hash. Typed text is also redacted in both standalone and sequence records: logs contain only character/byte counts, delay, and SHA-256. Files use mode `0600`, rotate at 10 MiB, and retain five archives.
 
 ## Diagnostics
 
@@ -197,6 +233,7 @@ Live tests are ignored during the normal suite:
 ```bash
 nix-shell --run 'cargo test --test live_hyprland observes_live_desktop -- --ignored --nocapture'
 nix-shell --run 'cargo test --test live_hyprland moves_and_restores_live_pointer -- --ignored --nocapture'
+nix-shell --run 'cargo test --test live_hyprland runs_and_audits_live_sequence -- --ignored --nocapture'
 ```
 
 The live suite safely probes screenshots, focus-on-current-window, waits, keyboard availability, and reversible movement. Side-effectful input remains opt-in:
@@ -214,7 +251,8 @@ The next capability layer is session recording and richer telemetry. The input i
 - [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
 - [Official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
 - [Hyprland IPC](https://wiki.hypr.land/IPC/)
-- [Using hyprctl](https://wiki.hypr.land/Configuring/Using-hyprctl/)
+- [Using hyprctl](https://wiki.hypr.land/Configuring/Advanced-and-Cool/Using-hyprctl/)
+- [Hyprland dispatchers](https://wiki.hypr.land/Configuring/Basics/Dispatchers/)
 - [Hyprland permissions](https://wiki.hypr.land/Configuring/Permissions/)
 
 ## License

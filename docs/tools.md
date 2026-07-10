@@ -1,6 +1,6 @@
 # MCP tool reference
 
-Hyprharness exposes ten tools over MCP stdio. Every tool has a JSON Schema, structured JSON output, a JSON text fallback, annotations for Codex approval decisions, and an audit record.
+Hyprharness exposes twelve tools over MCP stdio. Every tool has a JSON Schema, structured JSON output, a JSON text fallback, annotations for Codex approval decisions, and an audit record.
 
 ## Recommended workflow
 
@@ -103,6 +103,14 @@ For a straight UI test or an immediate diagnostic move:
 
 `window_id` must exactly match a mapped window's `stableId` or address from `list_windows`. Hyprharness resolves the identifier before dispatch, asks Hyprland to focus the exact address, then verifies the result. It returns the previous and newly focused window.
 
+### `switch_workspace`
+
+```json
+{ "workspace_id": 3 }
+```
+
+Focuses a positive numeric Hyprland workspace through compositor IPC, without simulating a keyboard shortcut. The server reads the previous focused workspace, dispatches the workspace focus, verifies the resulting focused monitor, and returns both workspace references plus the monitor name. Named, relative, special, and arbitrary dispatcher expressions are deliberately not accepted.
+
 ### `scroll`
 
 ```json
@@ -172,6 +180,86 @@ Text can still become visible in the target application and screenshot observati
 
 Waits `0..30000` ms and returns requested and measured elapsed time. It remains available in `--read-only` mode. Use it instead of shell `sleep` so the workflow stays within the MCP audit trail.
 
+## Choreography
+
+### `run_sequence`
+
+`run_sequence` executes a deterministic list of typed actions under one server-side action lock. It eliminates MCP/model round trips between rehearsed demo actions; it does not allow Codex to inspect and reason about intermediate screens.
+
+```json
+{
+  "steps": [
+    {
+      "action": "focus_window",
+      "window_id": "180000b1"
+    },
+    {
+      "action": "move_pointer",
+      "x": 1450,
+      "y": 180,
+      "motion": "natural",
+      "duration_ms": 900,
+      "guard": {
+        "focused_window_id": "180000b1",
+        "workspace_id": 2
+      }
+    },
+    {
+      "action": "wait",
+      "duration_ms": 250
+    },
+    {
+      "action": "click",
+      "button": "left",
+      "count": 1,
+      "guard": {
+        "focused_window_id": "180000b1"
+      }
+    },
+    {
+      "action": "wait",
+      "duration_ms": 800
+    },
+    {
+      "action": "switch_workspace",
+      "workspace_id": 3
+    }
+  ],
+  "observe_at_end": true,
+  "final_monitor": "eDP-1"
+}
+```
+
+Supported step actions and their action-specific fields:
+
+- `move_pointer`: `x`, `y`, optional `motion`, optional `duration_ms`.
+- `click`: optional `button`, `count`, and `interval_ms`.
+- `focus_window`: `window_id`.
+- `scroll`: `direction`, optional `amount`.
+- `press_key`: `key`, optional `modifiers` and `repeat`.
+- `type_text`: `text`, optional `interval_ms`.
+- `wait`: `duration_ms`.
+- `switch_workspace`: positive numeric `workspace_id`.
+
+Every step may include a `guard` with `focused_window_id`, `workspace_id`, or both. Guards are evaluated immediately before the step. For sequence `press_key` and `type_text`, `focused_window_id` is also passed into the keyboard backend's final stale-focus check.
+
+Sequence constraints:
+
+- `1..32` steps.
+- At most 45 seconds of conservatively planned movement, typing delay, click intervals, and waits.
+- Each `wait` step is limited to 10 seconds.
+- The full plan is validated before the first action.
+- Existing per-tool bounds, lock checks, monitor bounds, focus checks, and rate limits still apply.
+- The first guard or action failure stops the sequence; there is no continue-on-error mode.
+- No other pointer, focus, workspace, or keyboard action can interleave while it runs.
+- `final_monitor` is accepted only with `observe_at_end: true`; omitted means the focused monitor.
+
+Successful output contains a sequence ID, status, UTC timestamps, actual total duration, completed-step count, and a result/timing record for every step. When final observation is requested, the result also includes desktop metadata and PNG `ImageContent`.
+
+On failure, the MCP error code is `SEQUENCE_FAILED`. Its structured details contain the partial sequence report, including successful steps and the failed step's stable error code/message. GUI changes already completed cannot be rolled back.
+
+Use separate tool calls instead when an intermediate result is uncertain, a dialog may appear, or the next coordinate depends on a fresh screenshot.
+
 ## Safety failures
 
 Important stable error codes include:
@@ -182,6 +270,9 @@ Important stable error codes include:
 - `WINDOW_NOT_FOUND`: an exact stable ID/address did not resolve.
 - `FOCUS_FAILED`: Hyprland did not focus the resolved target.
 - `FOCUS_MISMATCH`: the expected keyboard target is not focused.
+- `SEQUENCE_GUARD_FAILED`: a sequence step's expected focus/workspace no longer matches.
+- `SEQUENCE_FAILED`: a fail-fast sequence stopped; partial results are in error details.
+- `WORKSPACE_SWITCH_FAILED`: Hyprland did not report the requested workspace as focused.
 - `WINDOW_REJECTS_INPUT`: the focused window does not accept input.
 - `KEYBOARD_UNAVAILABLE`: `wtype` or virtual-keyboard support failed.
 - `RATE_LIMITED`: a per-action one-minute limit was exceeded.
@@ -213,4 +304,10 @@ Recorded product demo:
 
 ```text
 Use hyprharness for a recorded-style demo. Observe before every coordinate action. Move the pointer with natural motion and an explicit 700-1000 ms duration when highlighting important controls, pause briefly before clicks, wait for each transition, and re-observe to verify it. Never use instant movement.
+```
+
+Deterministic recorded segment:
+
+```text
+Use hyprharness to observe and plan a deterministic demo segment. Then call run_sequence once with guarded natural pointer moves, brief waits before clicks, and observe_at_end enabled. Do not batch any step whose result must be inspected before deciding what to do next.
 ```

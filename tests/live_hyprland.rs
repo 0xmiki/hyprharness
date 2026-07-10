@@ -1,6 +1,7 @@
 use hyprharness::{
     Harness,
     models::{KeyModifier, MotionProfile, MouseButton, ScrollDirection},
+    sequence::{SequenceAction, SequenceGuard, SequenceStep},
 };
 
 #[tokio::test]
@@ -88,4 +89,86 @@ async fn moves_and_restores_live_pointer() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "runs a reversible action sequence in a live Hyprland session"]
+async fn runs_and_audits_live_sequence() {
+    let audit_dir = tempfile::tempdir().unwrap();
+    let audit_path = audit_dir.path().join("sequence-audit.jsonl");
+    let harness = Harness::from_environment(false, Some(audit_path.clone())).unwrap();
+    let origin = harness.get_cursor().await.unwrap().position;
+    let monitors = harness.monitors().await.unwrap();
+    let monitor = monitors
+        .iter()
+        .find(|monitor| monitor.contains(&origin))
+        .unwrap();
+    let workspace_id = i32::try_from(monitor.active_workspace.id).unwrap();
+    assert!(workspace_id > 0);
+    let offset = if origin.x + 80 < monitor.x + monitor.logical_width() {
+        80
+    } else {
+        -80
+    };
+    let workspace_guard = SequenceGuard {
+        focused_window_id: None,
+        workspace_id: Some(workspace_id),
+    };
+    let run = harness
+        .run_sequence(
+            vec![
+                SequenceStep {
+                    action: SequenceAction::MovePointer {
+                        x: origin.x + offset,
+                        y: origin.y,
+                        duration_ms: Some(250),
+                        motion: MotionProfile::Natural,
+                    },
+                    guard: workspace_guard.clone(),
+                },
+                SequenceStep {
+                    action: SequenceAction::Wait { duration_ms: 40 },
+                    guard: SequenceGuard::default(),
+                },
+                SequenceStep {
+                    action: SequenceAction::MovePointer {
+                        x: origin.x,
+                        y: origin.y,
+                        duration_ms: Some(250),
+                        motion: MotionProfile::Natural,
+                    },
+                    guard: workspace_guard.clone(),
+                },
+                SequenceStep {
+                    action: SequenceAction::SwitchWorkspace { workspace_id },
+                    guard: workspace_guard,
+                },
+            ],
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(run.execution.status, "completed");
+    assert_eq!(run.execution.completed_steps, 4);
+    assert_eq!(run.execution.steps.len(), 4);
+    assert!(run.execution.steps.iter().all(|step| step.ok));
+    assert!(run.execution.final_observation.is_some());
+    assert!(run.png.unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(harness.get_cursor().await.unwrap().position, origin);
+
+    let audit = std::fs::read_to_string(audit_path).unwrap();
+    let correlated: Vec<serde_json::Value> = audit
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|record: &serde_json::Value| record["sequence_id"] == run.execution.sequence_id)
+        .collect();
+    assert!(
+        correlated
+            .iter()
+            .any(|record| record["tool"] == "run_sequence")
+    );
+    assert!(correlated.iter().any(|record| record["step_index"] == 0));
+    assert!(correlated.iter().any(|record| record["step_index"] == 3));
 }

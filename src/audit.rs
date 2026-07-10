@@ -22,6 +22,10 @@ pub struct AuditRecord {
     pub timestamp: DateTime<Utc>,
     pub session_id: Uuid,
     pub request_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
     pub tool: String,
     pub arguments: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -135,6 +139,8 @@ mod tests {
             timestamp: Utc::now(),
             session_id: Uuid::nil(),
             request_id: Uuid::nil(),
+            sequence_id: None,
+            step_index: None,
             tool: "get_cursor".into(),
             arguments: serde_json::json!({}),
             active_window: None,
@@ -165,6 +171,8 @@ mod tests {
             timestamp: Utc::now(),
             session_id: Uuid::nil(),
             request_id: Uuid::nil(),
+            sequence_id: None,
+            step_index: None,
             tool: "rotation_test".into(),
             arguments: serde_json::json!({}),
             active_window: None,

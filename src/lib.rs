@@ -9,6 +9,7 @@ pub mod keyboard;
 pub mod mcp;
 pub mod models;
 pub mod policy;
+pub mod sequence;
 
 pub use error::{HarnessError, Result};
 pub use harness::Harness;
