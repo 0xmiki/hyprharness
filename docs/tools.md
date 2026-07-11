@@ -1,6 +1,6 @@
 # MCP tool reference
 
-Hyprharness exposes twelve tools over MCP stdio. Every tool has a JSON Schema, structured JSON output, a JSON text fallback, annotations for Codex approval decisions, and an audit record.
+Hyprharness exposes thirteen tools over MCP stdio. Every tool has a JSON Schema, structured JSON output, a JSON text fallback, annotations for Codex approval decisions, and an audit record.
 
 ## Recommended workflow
 
@@ -64,7 +64,7 @@ Returns mapped Hyprland clients with `stableId`, address, class/title, PID, geom
 - `natural` combines minimum-jerk acceleration/deceleration with a subtle deterministic Bézier curve. Its curve is kept inside the destination monitor when the move starts there.
 - `smooth` uses the same eased timing on a perfectly straight path.
 - `instant` emits one immediate Hyprland cursor command and ignores automatic timing.
-- Animated moves target approximately 90 Hz, deduplicate identical integer points, and finish at the exact coordinate.
+- Animated moves emit at most 60 Hyprland cursor IPC updates per second, deduplicate identical integer points, and finish at the exact coordinate. This cadence is designed for clean 60 FPS screen recordings.
 - The destination must fall inside an enabled, powered monitor.
 - Returns original, requested, and final positions, resolved duration, effective motion profile, emitted step count, and target monitor.
 
@@ -94,6 +94,34 @@ For a straight UI test or an immediate diagnostic move:
 - Count: `1..3`, default `1`.
 - Inter-click interval: `40..1000` ms, default `120`.
 - Clicking occurs at the current pointer position. Observe and move first.
+
+### `point_and_click`
+
+```json
+{
+  "x": 1390,
+  "y": 582,
+  "motion": "natural",
+  "duration_ms": 900,
+  "settle_ms": 300,
+  "button": "left",
+  "count": 1,
+  "guard": {
+    "focused_window_id": "180000b1",
+    "workspace_id": 2
+  }
+}
+```
+
+This composite tool is preferred for recorded demos:
+
+1. Validate all movement, pause, click, and guard arguments before moving.
+2. Follow the natural minimum-jerk path, which decelerates to zero at the exact target.
+3. Hold the pointer still for `settle_ms` (`300` ms by default, `0..2000`).
+4. Recheck optional focus/workspace guards immediately before clicking.
+5. Click while retaining the same global action lock, so no other input can interleave.
+
+Movement and click fields use the same limits/defaults as `move_pointer` and `click`. The result contains the complete movement result, requested and measured settling time, and click result. If the user moves the pointer, the session locks, or a guard changes during the settling pause, clicking is refused.
 
 ### `focus_window`
 
@@ -194,26 +222,15 @@ Waits `0..30000` ms and returns requested and measured elapsed time. It remains 
       "window_id": "180000b1"
     },
     {
-      "action": "move_pointer",
+      "action": "point_and_click",
       "x": 1450,
       "y": 180,
       "motion": "natural",
       "duration_ms": 900,
+      "settle_ms": 300,
       "guard": {
         "focused_window_id": "180000b1",
         "workspace_id": 2
-      }
-    },
-    {
-      "action": "wait",
-      "duration_ms": 250
-    },
-    {
-      "action": "click",
-      "button": "left",
-      "count": 1,
-      "guard": {
-        "focused_window_id": "180000b1"
       }
     },
     {
@@ -234,6 +251,7 @@ Supported step actions and their action-specific fields:
 
 - `move_pointer`: `x`, `y`, optional `motion`, optional `duration_ms`.
 - `click`: optional `button`, `count`, and `interval_ms`.
+- `point_and_click`: `x`, `y`, optional movement/click fields, and optional `settle_ms` (default `300`).
 - `focus_window`: `window_id`.
 - `scroll`: `direction`, optional `amount`.
 - `press_key`: `key`, optional `modifiers` and `repeat`.
@@ -273,6 +291,7 @@ Important stable error codes include:
 - `SEQUENCE_GUARD_FAILED`: a sequence step's expected focus/workspace no longer matches.
 - `SEQUENCE_FAILED`: a fail-fast sequence stopped; partial results are in error details.
 - `WORKSPACE_SWITCH_FAILED`: Hyprland did not report the requested workspace as focused.
+- `POINTER_MOVED_DURING_SETTLE`: the pointer left a `point_and_click` target before clicking.
 - `WINDOW_REJECTS_INPUT`: the focused window does not accept input.
 - `KEYBOARD_UNAVAILABLE`: `wtype` or virtual-keyboard support failed.
 - `RATE_LIMITED`: a per-action one-minute limit was exceeded.
@@ -303,7 +322,7 @@ Observe the focused monitor, move the pointer over the center of the document co
 Recorded product demo:
 
 ```text
-Use hyprharness for a recorded-style demo. Observe before every coordinate action. Move the pointer with natural motion and an explicit 700-1000 ms duration when highlighting important controls, pause briefly before clicks, wait for each transition, and re-observe to verify it. Never use instant movement.
+Use hyprharness for a recorded-style demo. Observe before every coordinate action. Use point_and_click with natural motion, an explicit 700-1000 ms movement, and a 250-400 ms settling pause when highlighting controls. Wait for each transition and re-observe to verify it. Never use instant movement.
 ```
 
 Deterministic recorded segment:

@@ -9,6 +9,7 @@ The server exposes a complete observe/focus/input loop:
 - `list_windows`
 - `move_pointer`
 - `click`
+- `point_and_click`
 - `focus_window`
 - `scroll`
 - `press_key`
@@ -55,18 +56,17 @@ Build the release binary, then register its absolute path from inside `nix-shell
 
 ```bash
 codex mcp add hyprharness \
-  --env XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-  --env HYPRLAND_INSTANCE_SIGNATURE="$HYPRLAND_INSTANCE_SIGNATURE" \
-  --env WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
   --env PATH="$PATH" \
   -- /absolute/path/to/hyprharness/target/release/hyprharness \
   mcp --audit-log /absolute/path/to/hyprharness/.hyprharness/audit.jsonl
 codex mcp list
 ```
 
-Use `/mcp` inside a newly started Codex session to confirm that all twelve tools are available. Codex launches the stdio server itself; do not run `hyprharness mcp` in a separate terminal. `Auth: Unsupported` is expected for a local stdio server.
+Do not register `HYPRLAND_INSTANCE_SIGNATURE`, `WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR` with `--env`: Codex persists those literal values and the Hyprland signature changes after a reboot. Add `env_vars = ["XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY"]` to the parent `[mcp_servers.hyprharness]` section so they are forwarded from each current Codex session. Keep the Nix-shell `PATH` as the static `.env` value so `grim` and `wtype` remain discoverable.
 
-For unattended local demos, the equivalent `config.toml` entry is:
+Use `/mcp` inside a newly started Codex session to confirm that all thirteen tools are available. Codex launches the stdio server itself; do not run `hyprharness mcp` in a separate terminal. `Auth: Unsupported` is expected for a local stdio server.
+
+For unattended local demos where Codex itself is launched from `nix-shell`, the equivalent fully dynamic `config.toml` entry is:
 
 ```toml
 [mcp_servers.hyprharness]
@@ -83,6 +83,9 @@ default_tools_approval_mode = "approve"
 approval_mode = "approve"
 
 [mcp_servers.hyprharness.tools.click]
+approval_mode = "approve"
+
+[mcp_servers.hyprharness.tools.point_and_click]
 approval_mode = "approve"
 
 [mcp_servers.hyprharness.tools.focus_window]
@@ -115,6 +118,7 @@ Put this in `~/.codex/config.toml`, or in a trusted project's `.codex/config.tom
 | `list_windows` | List mapped windows and stable identifiers. |
 | `move_pointer` | Move naturally, smoothly, or instantly to validated coordinates. |
 | `click` | Emit bounded left, middle, or right clicks. |
+| `point_and_click` | Decelerate to a target, settle visibly, then click atomically. |
 | `focus_window` | Focus a mapped window by exact `stableId` or address. |
 | `scroll` | Emit bounded discrete wheel steps at the pointer position. |
 | `press_key` | Press a validated key/shortcut in the focused window. |
@@ -144,11 +148,17 @@ Pointer coordinates are always Hyprland global logical coordinates. Screenshot p
 
 Input: `{ "x": integer, "y": integer, "motion"?: "natural"|"smooth"|"instant", "duration_ms"?: 0..3000 }`. Destinations outside all active monitor rectangles are rejected.
 
-`natural` is the default. It chooses a distance-aware duration (220–1200 ms), applies human-looking acceleration and deceleration, and follows a subtle bounded curve at approximately 90 Hz. `smooth` uses the same easing on a straight path. `instant`, or an explicit `duration_ms` of `0`, performs a single immediate move. Supply a nonzero duration when a demo needs exact pacing. All profiles finish at the exact requested coordinate.
+`natural` is the default. It chooses a distance-aware duration (220–1200 ms), applies human-looking acceleration and deceleration, and follows a subtle bounded curve with at most 60 Hyprland cursor IPC updates per second to align cleanly with 60 FPS recordings. `smooth` uses the same easing on a straight path. `instant`, or an explicit `duration_ms` of `0`, performs a single immediate move. Supply a nonzero duration when a demo needs exact pacing. All profiles finish at the exact requested coordinate.
 
 #### `click`
 
 Input: `{ "button"?: "left"|"middle"|"right", "count"?: 1..3, "interval_ms"?: 40..1000 }`. Defaults are a single left click and 120 ms interval.
+
+#### `point_and_click`
+
+Input: `{ "x": integer, "y": integer, "motion"?: "natural"|"smooth"|"instant", "duration_ms"?: 0..3000, "settle_ms"?: 0..2000, "button"?: "left"|"middle"|"right", "count"?: 1..3, "interval_ms"?: 40..1000, "guard"?: object }`.
+
+This is the preferred recorded-demo action. It holds the global action lock while the pointer follows its eased path and decelerates to zero, pauses at the exact target for 300 ms by default, verifies the pointer stayed there, rechecks optional `focused_window_id`/`workspace_id` guards, and then clicks. Its result reports the movement, requested/measured settling time, and click.
 
 ### Window and input tools
 
@@ -168,10 +178,12 @@ For keyboard safety, first call `list_windows`, focus the intended `stableId`, t
 ```json
 {
   "steps": [
-    { "action": "move_pointer", "x": 1450, "y": 180, "duration_ms": 900 },
-    { "action": "wait", "duration_ms": 250 },
     {
-      "action": "click",
+      "action": "point_and_click",
+      "x": 1450,
+      "y": 180,
+      "duration_ms": 900,
+      "settle_ms": 300,
       "button": "left",
       "guard": { "focused_window_id": "180000b1", "workspace_id": 2 }
     },
@@ -198,7 +210,7 @@ Regardless of Codex approval settings, the trusted server:
 - Rejects positions outside enabled, powered monitors.
 - Limits movement, click, focus, scroll, and keyboard event rates independently.
 - Validates button, click-count, scroll amount, key names, modifiers, repeats, text size, delays, and wait bounds.
-- Serializes all input actions so standalone calls cannot interleave with a running sequence.
+- Serializes all input actions; `point_and_click` keeps movement, settling, guard recheck, and click indivisible.
 - Preflights sequence size/duration and stops choreography on the first failed live guard or action.
 - Optionally verifies the expected focused window immediately before keyboard injection.
 - Exposes no command, executable, or shell-string arguments.

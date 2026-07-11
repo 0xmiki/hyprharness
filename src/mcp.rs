@@ -1,12 +1,12 @@
 use crate::{
     Harness,
     harness::{
-        ClickResult, CursorObservation, DesktopMetadata, FocusResult, MoveResult, PressKeyResult,
-        ScrollResult, SequenceExecution, SequenceRun, TypeTextResult, WaitResult,
-        WindowsObservation, WorkspaceResult,
+        ClickResult, CursorObservation, DesktopMetadata, FocusResult, MoveResult,
+        PointAndClickResult, PressKeyResult, ScrollResult, SequenceExecution, SequenceRun,
+        TypeTextResult, WaitResult, WindowsObservation, WorkspaceResult,
     },
     models::{KeyModifier, MotionProfile, MouseButton, Point, ScrollDirection},
-    sequence::SequenceStep,
+    sequence::{DEFAULT_SETTLE_MS, SequenceGuard, SequenceStep},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rmcp::{
@@ -19,7 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Observe before acting and re-observe after visible changes. Coordinates are Hyprland global logical coordinates, not image pixels. Use stableId from list_windows for focus_window and input guards. Pointer movement is natural and distance-timed by default; use explicit 700-1000 ms natural moves to emphasize controls in recorded demos. Use run_sequence only for deterministic choreography that does not require reasoning between steps; use individual calls whenever an intermediate screen must be inspected. Move the pointer over a scroll target before scrolling. Stop on safety errors and never infer coordinates from a stale observation.";
+const INSTRUCTIONS: &str = "Hyprharness controls the local Hyprland desktop. Observe before acting and re-observe after visible changes. Coordinates are Hyprland global logical coordinates, not image pixels. Use stableId from list_windows for focus_window and input guards. Pointer movement is natural and distance-timed by default; use point_and_click for demo-friendly deceleration, a visible settling pause, and an atomic click. Use run_sequence only for deterministic choreography that does not require reasoning between steps; use individual calls whenever an intermediate screen must be inspected. Move the pointer over a scroll target before scrolling. Stop on safety errors and never infer coordinates from a stale observation.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ObserveParams {
@@ -54,6 +54,38 @@ pub struct ClickParams {
     #[serde(default = "default_interval")]
     #[schemars(range(min = 40, max = 1000))]
     pub interval_ms: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PointAndClickParams {
+    /// Global logical X coordinate to approach and click.
+    pub x: i32,
+    /// Global logical Y coordinate to approach and click.
+    pub y: i32,
+    /// Movement duration in milliseconds, from 0 through 3000. Omit for distance-aware timing.
+    #[schemars(range(min = 0, max = 3000))]
+    pub duration_ms: Option<u32>,
+    /// Natural is subtly curved and decelerates at the target; smooth is straight and eased.
+    #[serde(default)]
+    pub motion: MotionProfile,
+    /// Visible pause after movement finishes and before the click, from 0 through 2000 ms.
+    #[serde(default = "default_settle_ms")]
+    #[schemars(range(min = 0, max = 2000))]
+    pub settle_ms: u32,
+    /// Mouse button to click after settling.
+    #[serde(default = "default_button")]
+    pub button: MouseButton,
+    /// Click count, from 1 through 3.
+    #[serde(default = "default_count")]
+    #[schemars(range(min = 1, max = 3))]
+    pub count: u8,
+    /// Delay between multiple clicks in milliseconds, from 40 through 1000.
+    #[serde(default = "default_interval")]
+    #[schemars(range(min = 40, max = 1000))]
+    pub interval_ms: u32,
+    /// Optional focus/workspace conditions checked before moving and again before clicking.
+    #[serde(default)]
+    pub guard: SequenceGuard,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -135,6 +167,10 @@ fn default_count() -> u8 {
 
 fn default_interval() -> u32 {
     120
+}
+
+fn default_settle_ms() -> u32 {
+    DEFAULT_SETTLE_MS
 }
 
 fn default_scroll_amount() -> u8 {
@@ -254,6 +290,40 @@ impl HyprHarnessMcp {
         structured(
             self.harness
                 .click(params.button, params.count, params.interval_ms)
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Move naturally to a validated coordinate, decelerate to a full stop, hold visibly at the target (300 ms by default), verify the pointer stayed there, recheck optional focus/workspace guards, then click without allowing other input to interleave. Preferred for recorded demos.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<PointAndClickResult>(),
+        annotations(
+            title = "Point and click",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn point_and_click(
+        &self,
+        Parameters(params): Parameters<PointAndClickParams>,
+    ) -> CallToolResult {
+        structured(
+            self.harness
+                .point_and_click(
+                    Point {
+                        x: params.x,
+                        y: params.y,
+                    },
+                    params.duration_ms,
+                    params.motion,
+                    params.settle_ms,
+                    params.button,
+                    params.count,
+                    params.interval_ms,
+                    params.guard,
+                )
                 .await,
         )
     }
@@ -480,6 +550,7 @@ mod tests {
             HyprHarnessMcp::list_windows_tool_attr(),
             HyprHarnessMcp::move_pointer_tool_attr(),
             HyprHarnessMcp::click_tool_attr(),
+            HyprHarnessMcp::point_and_click_tool_attr(),
             HyprHarnessMcp::focus_window_tool_attr(),
             HyprHarnessMcp::scroll_tool_attr(),
             HyprHarnessMcp::press_key_tool_attr(),
@@ -497,6 +568,7 @@ mod tests {
                 "list_windows",
                 "move_pointer",
                 "click",
+                "point_and_click",
                 "focus_window",
                 "scroll",
                 "press_key",
@@ -524,17 +596,25 @@ mod tests {
             "natural"
         );
         assert_eq!(tools[4].input_schema["properties"]["count"]["maximum"], 3);
-        assert_eq!(tools[6].input_schema["properties"]["amount"]["maximum"], 20);
         assert_eq!(
-            tools[9].input_schema["properties"]["duration_ms"]["maximum"],
+            tools[5].input_schema["properties"]["settle_ms"]["default"],
+            DEFAULT_SETTLE_MS
+        );
+        assert_eq!(
+            tools[5].input_schema["properties"]["settle_ms"]["maximum"],
+            2_000
+        );
+        assert_eq!(tools[7].input_schema["properties"]["amount"]["maximum"], 20);
+        assert_eq!(
+            tools[10].input_schema["properties"]["duration_ms"]["maximum"],
             30_000
         );
         assert_eq!(
-            tools[11].input_schema["properties"]["steps"]["maxItems"],
+            tools[12].input_schema["properties"]["steps"]["maxItems"],
             32
         );
         assert_eq!(
-            tools[11].annotations.as_ref().unwrap().destructive_hint,
+            tools[12].annotations.as_ref().unwrap().destructive_hint,
             Some(true)
         );
     }

@@ -8,8 +8,8 @@ use crate::{
     models::{KeyModifier, Monitor, MotionProfile, MouseButton, Point, ScrollDirection, Window},
     policy::SafetyPolicy,
     sequence::{
-        MAX_SEQUENCE_DURATION_MS, MAX_SEQUENCE_STEPS, MAX_SEQUENCE_WAIT_MS, SequenceAction,
-        SequenceGuard, SequenceStep, SequenceStepError, SequenceStepResult,
+        MAX_SEQUENCE_DURATION_MS, MAX_SEQUENCE_STEPS, MAX_SEQUENCE_WAIT_MS, MAX_SETTLE_MS,
+        SequenceAction, SequenceGuard, SequenceStep, SequenceStepError, SequenceStepResult,
     },
 };
 use chrono::{DateTime, Utc};
@@ -31,6 +31,8 @@ struct AuditContext {
 tokio::task_local! {
     static AUDIT_CONTEXT: AuditContext;
 }
+
+const POINTER_UPDATES_PER_SECOND: u32 = 60;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CursorObservation {
@@ -100,6 +102,14 @@ pub struct ClickResult {
     pub button: String,
     pub count: u8,
     pub interval_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct PointAndClickResult {
+    pub movement: MoveResult,
+    pub requested_settle_ms: u32,
+    pub actual_settle_ms: u128,
+    pub click: ClickResult,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -462,6 +472,105 @@ impl Harness {
         self.finish_audit(
             "click",
             json!({"button": button.as_str(), "count": count, "interval_ms": interval_ms}),
+            started,
+            &result,
+            before,
+            after,
+        )
+        .await?;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn point_and_click(
+        &self,
+        target: Point,
+        requested_duration_ms: Option<u32>,
+        motion: MotionProfile,
+        settle_ms: u32,
+        button: MouseButton,
+        count: u8,
+        interval_ms: u32,
+        guard: SequenceGuard,
+    ) -> Result<PointAndClickResult> {
+        let _action_guard = self.action_lock.lock().await;
+        self.point_and_click_inner(
+            target,
+            requested_duration_ms,
+            motion,
+            settle_ms,
+            button,
+            count,
+            interval_ms,
+            guard,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn point_and_click_inner(
+        &self,
+        target: Point,
+        requested_duration_ms: Option<u32>,
+        motion: MotionProfile,
+        settle_ms: u32,
+        button: MouseButton,
+        count: u8,
+        interval_ms: u32,
+        guard: SequenceGuard,
+    ) -> Result<PointAndClickResult> {
+        let started = Instant::now();
+        let before = self.ipc.cursor().await.ok();
+        self.audit.ensure_writable()?;
+        let result = async {
+            validate_point_and_click_arguments(
+                requested_duration_ms,
+                settle_ms,
+                count,
+                interval_ms,
+            )?;
+            self.validate_sequence_guard(&guard).await?;
+            let movement = self
+                .move_pointer_inner(target.clone(), requested_duration_ms, motion.clone())
+                .await?;
+            let settle_started = Instant::now();
+            sleep(Duration::from_millis(u64::from(settle_ms))).await;
+            let actual_settle_ms = settle_started.elapsed().as_millis();
+            let settled_position = self.ipc.cursor().await?;
+            if settled_position != target {
+                return Err(HarnessError::new(
+                    "POINTER_MOVED_DURING_SETTLE",
+                    "pointer left the requested target during the settling pause",
+                )
+                .with_details(json!({
+                    "expected": target,
+                    "actual": settled_position,
+                })));
+            }
+            self.validate_sequence_guard(&guard).await?;
+            let click = self.click_inner(button.clone(), count, interval_ms).await?;
+            Ok(PointAndClickResult {
+                movement,
+                requested_settle_ms: settle_ms,
+                actual_settle_ms,
+                click,
+            })
+        }
+        .await;
+        let after = self.ipc.cursor().await.ok();
+        self.finish_audit(
+            "point_and_click",
+            json!({
+                "x": target.x,
+                "y": target.y,
+                "duration_ms": requested_duration_ms,
+                "motion": motion.as_str(),
+                "settle_ms": settle_ms,
+                "button": button.as_str(),
+                "count": count,
+                "interval_ms": interval_ms,
+                "guard": guard,
+            }),
             started,
             &result,
             before,
@@ -993,6 +1102,26 @@ impl Harness {
                         return Err(invalid("interval_ms must be between 40 and 1000"));
                     }
                 }
+                SequenceAction::PointAndClick {
+                    x,
+                    y,
+                    duration_ms,
+                    settle_ms,
+                    count,
+                    interval_ms,
+                    ..
+                } => {
+                    validate_point_and_click_arguments(
+                        *duration_ms,
+                        *settle_ms,
+                        *count,
+                        *interval_ms,
+                    )
+                    .map_err(|error| invalid(&error.message))?;
+                    self.policy
+                        .validate_target(&Point { x: *x, y: *y }, &monitors)
+                        .map_err(|error| invalid(&error.message))?;
+                }
                 SequenceAction::FocusWindow { window_id } if window_id.is_empty() => {
                     return Err(invalid("window_id cannot be empty"));
                 }
@@ -1103,6 +1232,28 @@ impl Harness {
                 count,
                 interval_ms,
             } => serde_json::to_value(self.click_inner(button, count, interval_ms).await?),
+            SequenceAction::PointAndClick {
+                x,
+                y,
+                duration_ms,
+                motion,
+                settle_ms,
+                button,
+                count,
+                interval_ms,
+            } => serde_json::to_value(
+                self.point_and_click_inner(
+                    Point { x, y },
+                    duration_ms,
+                    motion,
+                    settle_ms,
+                    button,
+                    count,
+                    interval_ms,
+                    guard.clone(),
+                )
+                .await?,
+            ),
             SequenceAction::FocusWindow { window_id } => {
                 serde_json::to_value(self.focus_window_inner(window_id).await?)
             }
@@ -1338,6 +1489,33 @@ fn point_distance(start: &Point, end: &Point) -> f64 {
     f64::from(end.x - start.x).hypot(f64::from(end.y - start.y))
 }
 
+fn validate_point_and_click_arguments(
+    requested_duration_ms: Option<u32>,
+    settle_ms: u32,
+    count: u8,
+    interval_ms: u32,
+) -> Result<()> {
+    if requested_duration_ms.is_some_and(|duration| duration > 3_000) {
+        return Err(HarnessError::invalid(
+            "duration_ms must be between 0 and 3000",
+        ));
+    }
+    if settle_ms > MAX_SETTLE_MS {
+        return Err(HarnessError::invalid(format!(
+            "settle_ms must be between 0 and {MAX_SETTLE_MS}"
+        )));
+    }
+    if !(1..=3).contains(&count) {
+        return Err(HarnessError::invalid("count must be between 1 and 3"));
+    }
+    if !(40..=1_000).contains(&interval_ms) {
+        return Err(HarnessError::invalid(
+            "interval_ms must be between 40 and 1000",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_move_duration(
     requested_duration_ms: Option<u32>,
     motion: &MotionProfile,
@@ -1369,8 +1547,7 @@ fn pointer_path(
         return vec![target.clone()];
     }
 
-    // 90 Hz is smooth in recordings without flooding Hyprland's command socket.
-    let steps = ((f64::from(duration_ms) / (1_000.0 / 90.0)).ceil() as u32).max(1);
+    let steps = pointer_animation_steps(duration_ms);
     let can_curve = *motion == MotionProfile::Natural && target_monitor.contains(origin);
     let distance = point_distance(origin, target);
     let sign = if (origin.x ^ origin.y ^ target.x ^ target.y) & 1 == 0 {
@@ -1436,6 +1613,13 @@ fn pointer_path(
     path
 }
 
+fn pointer_animation_steps(duration_ms: u32) -> u32 {
+    duration_ms
+        .saturating_mul(POINTER_UPDATES_PER_SECOND)
+        .div_ceil(1_000)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1448,6 +1632,39 @@ mod tests {
             .map(|step| minimum_jerk(f64::from(step) / 100.0))
             .collect();
         assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn minimum_jerk_decelerates_into_the_target() {
+        let early = minimum_jerk(0.01) - minimum_jerk(0.0);
+        let middle = minimum_jerk(0.51) - minimum_jerk(0.5);
+        let late = minimum_jerk(1.0) - minimum_jerk(0.99);
+        assert!(early < middle);
+        assert!(late < middle);
+        assert!((early - late).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pointer_animation_is_capped_at_sixty_ipc_updates_per_second() {
+        assert_eq!(pointer_animation_steps(1_000), 60);
+        assert_eq!(pointer_animation_steps(500), 30);
+        assert_eq!(pointer_animation_steps(100), 6);
+        assert_eq!(pointer_animation_steps(16), 1);
+        assert_eq!(pointer_animation_steps(17), 2);
+    }
+
+    #[test]
+    fn point_and_click_argument_limits_fail_before_input() {
+        assert!(validate_point_and_click_arguments(None, 300, 1, 120).is_ok());
+        assert_eq!(
+            validate_point_and_click_arguments(None, MAX_SETTLE_MS + 1, 1, 120)
+                .unwrap_err()
+                .code,
+            "INVALID_ARGUMENT"
+        );
+        assert!(validate_point_and_click_arguments(Some(3_001), 300, 1, 120).is_err());
+        assert!(validate_point_and_click_arguments(None, 300, 0, 120).is_err());
+        assert!(validate_point_and_click_arguments(None, 300, 1, 39).is_err());
     }
 
     #[test]

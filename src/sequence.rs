@@ -6,6 +6,8 @@ use serde_json::Value;
 pub const MAX_SEQUENCE_STEPS: usize = 32;
 pub const MAX_SEQUENCE_DURATION_MS: u64 = 45_000;
 pub const MAX_SEQUENCE_WAIT_MS: u32 = 10_000;
+pub const MAX_SETTLE_MS: u32 = 2_000;
+pub const DEFAULT_SETTLE_MS: u32 = 300;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SequenceGuard {
@@ -37,6 +39,25 @@ pub enum SequenceAction {
         motion: MotionProfile,
     },
     Click {
+        #[serde(default = "default_button")]
+        button: MouseButton,
+        #[serde(default = "default_count")]
+        #[schemars(range(min = 1, max = 3))]
+        count: u8,
+        #[serde(default = "default_click_interval")]
+        #[schemars(range(min = 40, max = 1000))]
+        interval_ms: u32,
+    },
+    PointAndClick {
+        x: i32,
+        y: i32,
+        #[schemars(range(min = 0, max = 3000))]
+        duration_ms: Option<u32>,
+        #[serde(default)]
+        motion: MotionProfile,
+        #[serde(default = "default_settle_ms")]
+        #[schemars(range(min = 0, max = 2000))]
+        settle_ms: u32,
         #[serde(default = "default_button")]
         button: MouseButton,
         #[serde(default = "default_count")]
@@ -84,6 +105,7 @@ impl SequenceAction {
         match self {
             Self::MovePointer { .. } => "move_pointer",
             Self::Click { .. } => "click",
+            Self::PointAndClick { .. } => "point_and_click",
             Self::FocusWindow { .. } => "focus_window",
             Self::Scroll { .. } => "scroll",
             Self::PressKey { .. } => "press_key",
@@ -113,6 +135,23 @@ impl SequenceAction {
             Self::Click {
                 count, interval_ms, ..
             } => u64::from(count.saturating_sub(1)) * u64::from(*interval_ms),
+            Self::PointAndClick {
+                duration_ms,
+                motion,
+                settle_ms,
+                count,
+                interval_ms,
+                ..
+            } => {
+                let movement = if *motion == MotionProfile::Instant {
+                    0
+                } else {
+                    u64::from(duration_ms.unwrap_or(1_200))
+                };
+                movement
+                    + u64::from(*settle_ms)
+                    + u64::from(count.saturating_sub(1)) * u64::from(*interval_ms)
+            }
             Self::TypeText {
                 text, interval_ms, ..
             } => (text.chars().count() as u64).saturating_mul(u64::from(*interval_ms)),
@@ -155,6 +194,10 @@ fn default_click_interval() -> u32 {
     120
 }
 
+fn default_settle_ms() -> u32 {
+    DEFAULT_SETTLE_MS
+}
+
 fn default_scroll_amount() -> u8 {
     3
 }
@@ -194,5 +237,28 @@ mod tests {
             motion: MotionProfile::Natural,
         };
         assert_eq!(action.planned_duration_ms(), 1_200);
+    }
+
+    #[test]
+    fn point_and_click_defaults_to_natural_motion_and_demo_settle() {
+        let step: SequenceStep = serde_json::from_value(serde_json::json!({
+            "action": "point_and_click",
+            "x": 400,
+            "y": 300
+        }))
+        .unwrap();
+        assert!(matches!(
+            step.action,
+            SequenceAction::PointAndClick {
+                motion: MotionProfile::Natural,
+                duration_ms: None,
+                settle_ms: DEFAULT_SETTLE_MS,
+                button: MouseButton::Left,
+                count: 1,
+                interval_ms: 120,
+                ..
+            }
+        ));
+        assert_eq!(step.action.planned_duration_ms(), 1_500);
     }
 }
