@@ -19,7 +19,6 @@ pub trait HyprlandApi: Send + Sync {
     async fn windows(&self) -> Result<Vec<Window>>;
     async fn cursor(&self) -> Result<Point>;
     async fn locked(&self) -> Result<bool>;
-    async fn move_cursor(&self, point: Point) -> Result<()>;
     async fn focus_window(&self, address: &str) -> Result<()>;
     async fn focus_workspace(&self, workspace_id: i32) -> Result<()>;
     async fn version(&self) -> Result<serde_json::Value>;
@@ -132,11 +131,6 @@ impl HyprlandApi for HyprlandIpc {
     async fn locked(&self) -> Result<bool> {
         let status: LockStatus = self.json("locked").await?;
         Ok(status.locked)
-    }
-
-    async fn move_cursor(&self, point: Point) -> Result<()> {
-        self.dispatch(&format!("movecursor {} {}", point.x, point.y))
-            .await
     }
 
     async fn focus_window(&self, address: &str) -> Result<()> {

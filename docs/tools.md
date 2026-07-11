@@ -64,9 +64,11 @@ Returns mapped Hyprland clients with `stableId`, address, class/title, PID, geom
 - `natural` combines minimum-jerk acceleration/deceleration with a subtle deterministic Bézier curve. Its curve is kept inside the destination monitor when the move starts there.
 - `smooth` uses the same eased timing on a perfectly straight path.
 - `instant` emits one immediate Hyprland cursor command and ignores automatic timing.
-- Animated moves emit at most 60 Hyprland cursor IPC updates per second, deduplicate identical integer points, and finish at the exact coordinate. This cadence is designed for clean 60 FPS screen recordings.
+- Animated moves emit at most 60 Wayland `motion_absolute` frames per second over one persistent virtual-pointer connection, deduplicate identical integer points, and finish at the exact coordinate. This cadence is designed for clean 60 FPS screen recordings.
 - The destination must fall inside an enabled, powered monitor.
-- Returns original, requested, and final positions, resolved duration, effective motion profile, emitted step count, and target monitor.
+- The complete trajectory is validated before its first frame. Negative monitor origins are shifted into the protocol's unsigned absolute coordinate frame using the active logical desktop bounds.
+- Hyprland IPC is queried after the Wayland actor synchronizes; a mismatched endpoint fails with `POINTER_MOVE_MISMATCH`.
+- Returns original, requested, and final positions, resolved duration, effective motion profile, emitted step count, `wayland_virtual_pointer` backend, and target monitor.
 
 For a deliberately paced product-demo move:
 
@@ -292,6 +294,7 @@ Important stable error codes include:
 - `SEQUENCE_FAILED`: a fail-fast sequence stopped; partial results are in error details.
 - `WORKSPACE_SWITCH_FAILED`: Hyprland did not report the requested workspace as focused.
 - `POINTER_MOVED_DURING_SETTLE`: the pointer left a `point_and_click` target before clicking.
+- `POINTER_MOVE_MISMATCH`: Wayland movement did not finish at the exact IPC-verified target.
 - `WINDOW_REJECTS_INPUT`: the focused window does not accept input.
 - `KEYBOARD_UNAVAILABLE`: `wtype` or virtual-keyboard support failed.
 - `RATE_LIMITED`: a per-action one-minute limit was exceeded.

@@ -35,7 +35,7 @@ hyprharness
     └── rotating JSONL action audit
 ```
 
-Hyprland queries, focus, and cursor movement use its compositor socket directly. Screenshots use `grim` with a fixed argument list, never a shell. Clicks and scrolling use `zwlr_virtual_pointer_v1`; keyboard input uses `wtype` and Wayland's virtual-keyboard protocol. No privileged `uinput` daemon is required.
+Hyprland IPC is the state/control plane for cursor queries, monitor/window discovery, focus, lock state, and workspace switching. Pointer movement, clicks, and scrolling share one persistent `zwlr_virtual_pointer_v1` Wayland device; complete 60 Hz trajectories are sent to its dedicated actor instead of opening a compositor socket for every frame. Screenshots use `grim` with a fixed argument list, never a shell, and keyboard input uses `wtype` with Wayland's virtual-keyboard protocol. No privileged `uinput` daemon is required.
 
 ## Build and verify
 
@@ -148,7 +148,7 @@ Pointer coordinates are always Hyprland global logical coordinates. Screenshot p
 
 Input: `{ "x": integer, "y": integer, "motion"?: "natural"|"smooth"|"instant", "duration_ms"?: 0..3000 }`. Destinations outside all active monitor rectangles are rejected.
 
-`natural` is the default. It chooses a distance-aware duration (220–1200 ms), applies human-looking acceleration and deceleration, and follows a subtle bounded curve with at most 60 Hyprland cursor IPC updates per second to align cleanly with 60 FPS recordings. `smooth` uses the same easing on a straight path. `instant`, or an explicit `duration_ms` of `0`, performs a single immediate move. Supply a nonzero duration when a demo needs exact pacing. All profiles finish at the exact requested coordinate.
+`natural` is the default. It chooses a distance-aware duration (220–1200 ms), applies human-looking acceleration and deceleration, and follows a subtle bounded curve with at most 60 Wayland motion frames per second to align cleanly with 60 FPS recordings. `smooth` uses the same easing on a straight path. `instant`, or an explicit `duration_ms` of `0`, performs a single absolute Wayland move. Supply a nonzero duration when a demo needs exact pacing. Hyprland IPC verifies every final coordinate, and results identify the `wayland_virtual_pointer` backend.
 
 #### `click`
 

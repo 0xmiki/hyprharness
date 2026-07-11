@@ -2,7 +2,7 @@ use crate::{
     audit::{AuditLogger, AuditRecord},
     capture::{Capture, GrimCapture, ScreenshotApi},
     error::{HarnessError, Result},
-    input::{PointerApi, VirtualPointerActor},
+    input::{DesktopBounds, PointerApi, VirtualPointerActor},
     ipc::{HyprlandApi, HyprlandIpc},
     keyboard::{KeyboardApi, WtypeKeyboard, normalize_key},
     models::{KeyModifier, Monitor, MotionProfile, MouseButton, Point, ScrollDirection, Window},
@@ -93,6 +93,7 @@ pub struct MoveResult {
     pub duration_ms: u32,
     pub motion: String,
     pub steps: u32,
+    pub backend: String,
     pub monitor: String,
 }
 
@@ -375,22 +376,31 @@ impl Harness {
                 motion.clone()
             };
             let path = pointer_path(&origin, &target, &monitor, &effective_motion, duration_ms);
-            if effective_motion == MotionProfile::Instant {
-                self.ipc.move_cursor(target.clone()).await?;
-            } else {
-                let animation_started = Instant::now();
-                let path_len = path.len();
-                for (index, point) in path.iter().enumerate() {
-                    self.ipc.move_cursor(point.clone()).await?;
-                    if index + 1 < path_len {
-                        let next_frame = (index + 1) as f64 / (path_len - 1) as f64;
-                        let deadline = animation_started
-                            + Duration::from_secs_f64(f64::from(duration_ms) * next_frame / 1000.0);
-                        tokio::time::sleep_until(deadline).await;
-                    }
-                }
-            }
+            let bounds = DesktopBounds::from_monitors(&monitors)?;
+            self.pointer
+                .move_trajectory(
+                    path.clone(),
+                    bounds,
+                    Duration::from_millis(u64::from(duration_ms)),
+                )
+                .await?;
             let ended_at = self.ipc.cursor().await?;
+            if ended_at != target {
+                return Err(HarnessError::new(
+                    "POINTER_MOVE_MISMATCH",
+                    "Wayland virtual pointer did not finish at the requested coordinate",
+                )
+                .with_details(json!({
+                    "requested": target,
+                    "actual": ended_at,
+                    "desktop_bounds": {
+                        "x": bounds.x,
+                        "y": bounds.y,
+                        "width": bounds.width,
+                        "height": bounds.height,
+                    },
+                })));
+            }
             Ok(MoveResult {
                 started_at: origin,
                 ended_at,
@@ -398,6 +408,7 @@ impl Harness {
                 duration_ms,
                 motion: effective_motion.as_str().into(),
                 steps: path.len() as u32,
+                backend: "wayland_virtual_pointer".into(),
                 monitor: monitor.name,
             })
         }

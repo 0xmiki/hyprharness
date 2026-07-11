@@ -49,14 +49,16 @@ async fn moves_and_restores_live_pointer() {
         x: origin.x + offset,
         y: origin.y,
     };
-    harness
+    let moved = harness
         .move_pointer(target, None, MotionProfile::Natural)
         .await
         .unwrap();
-    harness
+    assert_eq!(moved.backend, "wayland_virtual_pointer");
+    let restored = harness
         .move_pointer(origin.clone(), None, MotionProfile::Natural)
         .await
         .unwrap();
+    assert_eq!(restored.backend, "wayland_virtual_pointer");
     assert_eq!(harness.get_cursor().await.unwrap().position, origin);
 
     if std::env::var("HYPRHARNESS_LIVE_CLICK").as_deref() == Ok("1") {

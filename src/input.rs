@@ -1,6 +1,6 @@
 use crate::{
     error::{HarnessError, Result},
-    models::{MouseButton, ScrollDirection},
+    models::{Monitor, MouseButton, Point, ScrollDirection},
 };
 use async_trait::async_trait;
 use std::{
@@ -21,12 +21,101 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 
 #[async_trait]
 pub trait PointerApi: Send + Sync {
+    async fn move_trajectory(
+        &self,
+        points: Vec<Point>,
+        bounds: DesktopBounds,
+        duration: Duration,
+    ) -> Result<()>;
     async fn click(&self, button: MouseButton, count: u8, interval: Duration) -> Result<()>;
     async fn scroll(&self, direction: ScrollDirection, amount: u8) -> Result<()>;
     async fn probe(&self) -> Result<()>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DesktopBounds {
+    pub fn from_monitors(monitors: &[Monitor]) -> Result<Self> {
+        let active: Vec<_> = monitors
+            .iter()
+            .filter(|monitor| !monitor.disabled && monitor.dpms_status)
+            .collect();
+        let min_x = active
+            .iter()
+            .map(|monitor| i64::from(monitor.x))
+            .min()
+            .ok_or_else(|| HarnessError::new("OUT_OF_BOUNDS", "no active monitors found"))?;
+        let min_y = active
+            .iter()
+            .map(|monitor| i64::from(monitor.y))
+            .min()
+            .ok_or_else(|| HarnessError::new("OUT_OF_BOUNDS", "no active monitors found"))?;
+        let max_x = active
+            .iter()
+            .map(|monitor| i64::from(monitor.x) + i64::from(monitor.logical_width()))
+            .max()
+            .unwrap();
+        let max_y = active
+            .iter()
+            .map(|monitor| i64::from(monitor.y) + i64::from(monitor.logical_height()))
+            .max()
+            .unwrap();
+        let width = u32::try_from(max_x - min_x)
+            .ok()
+            .filter(|width| *width > 0)
+            .ok_or_else(|| HarnessError::invalid("active monitor layout width is invalid"))?;
+        let height = u32::try_from(max_y - min_y)
+            .ok()
+            .filter(|height| *height > 0)
+            .ok_or_else(|| HarnessError::invalid("active monitor layout height is invalid"))?;
+        Ok(Self {
+            x: i32::try_from(min_x)
+                .map_err(|_| HarnessError::invalid("monitor layout X origin is invalid"))?,
+            y: i32::try_from(min_y)
+                .map_err(|_| HarnessError::invalid("monitor layout Y origin is invalid"))?,
+            width,
+            height,
+        })
+    }
+
+    fn map_point(self, point: &Point) -> Result<AbsolutePoint> {
+        let x = i64::from(point.x) - i64::from(self.x);
+        let y = i64::from(point.y) - i64::from(self.y);
+        if x < 0 || y < 0 || x >= i64::from(self.width) || y >= i64::from(self.height) {
+            return Err(HarnessError::new(
+                "OUT_OF_BOUNDS",
+                format!(
+                    "point ({}, {}) is outside Wayland desktop bounds",
+                    point.x, point.y
+                ),
+            ));
+        }
+        Ok(AbsolutePoint {
+            x: x as u32,
+            y: y as u32,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbsolutePoint {
+    x: u32,
+    y: u32,
+}
+
 enum Command {
+    MoveTrajectory {
+        points: Vec<Point>,
+        bounds: DesktopBounds,
+        duration: Duration,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Click {
         button: MouseButton,
         count: u8,
@@ -79,6 +168,25 @@ impl VirtualPointerActor {
 
 #[async_trait]
 impl PointerApi for VirtualPointerActor {
+    async fn move_trajectory(
+        &self,
+        points: Vec<Point>,
+        bounds: DesktopBounds,
+        duration: Duration,
+    ) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(
+            Command::MoveTrajectory {
+                points,
+                bounds,
+                duration,
+                reply,
+            },
+            receiver,
+        )
+        .await
+    }
+
     async fn click(&self, button: MouseButton, count: u8, interval: Duration) -> Result<()> {
         let (reply, receiver) = oneshot::channel();
         self.send(
@@ -168,6 +276,45 @@ impl WaylandPointer {
         Ok(())
     }
 
+    fn move_trajectory(
+        &self,
+        points: &[Point],
+        bounds: DesktopBounds,
+        duration: Duration,
+    ) -> Result<()> {
+        if points.is_empty() {
+            return Err(HarnessError::invalid(
+                "pointer trajectory must contain at least one point",
+            ));
+        }
+        let absolute_points: Vec<_> = points
+            .iter()
+            .map(|point| bounds.map_point(point))
+            .collect::<Result<_>>()?;
+        let movement_started = Instant::now();
+        let last_index = absolute_points.len().saturating_sub(1);
+        for (index, point) in absolute_points.iter().enumerate() {
+            let time = self.started.elapsed().as_millis() as u32;
+            self.pointer
+                .motion_absolute(time, point.x, point.y, bounds.width, bounds.height);
+            self.pointer.frame();
+            self.connection
+                .flush()
+                .map_err(|error| HarnessError::io("INPUT_UNAVAILABLE", "move pointer", error))?;
+            if index < last_index {
+                let progress = (index + 1) as f64 / last_index as f64;
+                let deadline = movement_started + duration.mul_f64(progress);
+                if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                    thread::sleep(remaining);
+                }
+            }
+        }
+        self.connection
+            .roundtrip()
+            .map(|_| ())
+            .map_err(|error| HarnessError::io("INPUT_UNAVAILABLE", "sync pointer movement", error))
+    }
+
     fn button(&self, code: u32, state: wl_pointer::ButtonState) -> Result<()> {
         let time = self.started.elapsed().as_millis() as u32;
         self.pointer.button(time, code, state);
@@ -204,6 +351,13 @@ fn run_actor(receiver: Receiver<Command>) {
     for command in receiver {
         let result = match &command {
             Command::Probe { .. } => ensure_pointer(&mut pointer).map(|_| ()),
+            Command::MoveTrajectory {
+                points,
+                bounds,
+                duration,
+                ..
+            } => ensure_pointer(&mut pointer)
+                .and_then(|pointer| pointer.move_trajectory(points, *bounds, *duration)),
             Command::Click {
                 button,
                 count,
@@ -218,6 +372,7 @@ fn run_actor(receiver: Receiver<Command>) {
         };
         match command {
             Command::Probe { reply }
+            | Command::MoveTrajectory { reply, .. }
             | Command::Click { reply, .. }
             | Command::Scroll { reply, .. } => {
                 let _ = reply.send(result);
@@ -236,4 +391,67 @@ fn ensure_pointer(pointer: &mut Option<WaylandPointer>) -> Result<&WaylandPointe
             "virtual pointer could not be initialized",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::WorkspaceRef;
+
+    fn monitor(x: i32, y: i32, width: i32, height: i32, scale: f64) -> Monitor {
+        Monitor {
+            id: 0,
+            name: "test".into(),
+            description: String::new(),
+            width,
+            height,
+            x,
+            y,
+            scale,
+            transform: 0,
+            focused: true,
+            disabled: false,
+            dpms_status: true,
+            active_workspace: WorkspaceRef::default(),
+        }
+    }
+
+    #[test]
+    fn maps_negative_and_scaled_monitor_layouts_to_unsigned_wayland_space() {
+        let bounds = DesktopBounds::from_monitors(&[
+            monitor(-1920, 0, 1920, 1080, 1.0),
+            monitor(0, 0, 1920, 1080, 2.0),
+        ])
+        .unwrap();
+        assert_eq!(
+            bounds,
+            DesktopBounds {
+                x: -1920,
+                y: 0,
+                width: 2880,
+                height: 1080,
+            }
+        );
+        assert_eq!(
+            bounds.map_point(&Point { x: -1920, y: 0 }).unwrap(),
+            AbsolutePoint { x: 0, y: 0 }
+        );
+        assert_eq!(
+            bounds.map_point(&Point { x: 959, y: 539 }).unwrap(),
+            AbsolutePoint { x: 2879, y: 539 }
+        );
+    }
+
+    #[test]
+    fn rejects_points_outside_the_wayland_coordinate_frame() {
+        let bounds = DesktopBounds {
+            x: -100,
+            y: -50,
+            width: 200,
+            height: 100,
+        };
+        assert!(bounds.map_point(&Point { x: -101, y: 0 }).is_err());
+        assert!(bounds.map_point(&Point { x: 100, y: 0 }).is_err());
+        assert!(bounds.map_point(&Point { x: 0, y: 50 }).is_err());
+    }
 }
