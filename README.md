@@ -1,24 +1,163 @@
 # hyprharness
 
-`hyprharness` is a local, safety-focused MCP server that lets Codex observe and operate a Hyprland desktop. It exposes typed desktop tools instead of an unrestricted shell and keeps a durable audit trail of every request.
+Native, auditable computer use for Codex on Hyprland.
 
-The server exposes a complete observe/focus/input loop:
+`hyprharness` is a local Rust MCP server that gives Codex eyes and a carefully
+bounded set of desktop controls. Codex can inspect the desktop, move and click
+the pointer, type, focus windows, switch workspaces, and choreograph complete
+product-demo sequences—without being given an unrestricted shell tool.
 
-- `observe_desktop`
-- `get_cursor`
-- `list_windows`
-- `move_pointer`
-- `click`
-- `point_and_click`
-- `focus_window`
-- `scroll`
-- `press_key`
-- `type_text`
-- `wait`
-- `switch_workspace`
-- `run_sequence`
+The server combines Hyprland IPC for desktop state and window management with a
+persistent Wayland virtual pointer for smooth, efficient input. Every action is
+validated, serialized, checked against the live desktop, and written to an
+audit log.
 
-It also includes `doctor`, `observe`, `test-pointer`, and `permissions` commands for human diagnostics.
+| | |
+|---|---|
+| Platform | Linux, Hyprland, Wayland |
+| Protocol | MCP over local stdio |
+| Observation | `grim` screenshots plus structured desktop metadata |
+| Pointer input | Persistent `zwlr_virtual_pointer_v1` connection |
+| Keyboard input | `wtype` |
+| Demo motion | Natural or smooth 60 Hz trajectories, settling, and sequences |
+| Safety | Typed tools, bounds checks, lock detection, guards, limits, audit |
+
+The current server exposes 13 tools. It is intentionally local and
+Hyprland-specific; it does not require root, a privileged daemon, or `/dev/uinput`.
+
+## Quick start
+
+### 1. Requirements
+
+You need:
+
+- a running Hyprland session;
+- a compositor with the wlr virtual-pointer protocol (Hyprland provides it);
+- `grim` for screenshots;
+- `wtype` for keyboard input; and
+- Codex CLI with MCP support.
+
+The included [`shell.nix`](shell.nix) supplies the Rust toolchain and runtime
+utilities used by the project.
+
+### 2. Build and check the session
+
+Run project commands through the Nix shell:
+
+```bash
+nix-shell --run 'cargo build --release'
+nix-shell --run 'target/release/hyprharness doctor'
+```
+
+`doctor` checks the Hyprland and Wayland environment, IPC access, required
+programs, screenshot capture, and the virtual-pointer protocol.
+
+### 3. Register it with Codex
+
+Enter the project shell so the registration captures the runtime `PATH` that
+contains `grim` and `wtype`:
+
+```bash
+nix-shell
+codex mcp add hyprharness \
+  --env PATH="$PATH" \
+  -- /absolute/path/to/hyprharness/target/release/hyprharness \
+  mcp \
+  --audit-log /absolute/path/to/hyprharness/.hyprharness/audit.jsonl
+```
+
+Then add the live session variables to the parent server table in Codex's
+configuration:
+
+```toml
+[mcp_servers.hyprharness]
+command = "/absolute/path/to/hyprharness/target/release/hyprharness"
+args = [
+  "mcp",
+  "--audit-log",
+  "/absolute/path/to/hyprharness/.hyprharness/audit.jsonl",
+]
+cwd = "/absolute/path/to/hyprharness"
+env_vars = [
+  "XDG_RUNTIME_DIR",
+  "HYPRLAND_INSTANCE_SIGNATURE",
+  "WAYLAND_DISPLAY",
+]
+required = true
+startup_timeout_sec = 10
+tool_timeout_sec = 60
+default_tools_approval_mode = "approve"
+
+[mcp_servers.hyprharness.env]
+# Keep the PATH written by `codex mcp add` here.
+PATH = "/nix/store/.../bin:..."
+```
+
+The distinction matters after a reboot:
+
+- `PATH` can be stored because it comes from this project's Nix environment.
+- `HYPRLAND_INSTANCE_SIGNATURE`, `WAYLAND_DISPLAY`, and `XDG_RUNTIME_DIR` must
+  be inherited through `env_vars`; their values describe the current login
+  session and can change after a reboot.
+
+Do not copy a current Hyprland instance signature into
+`[mcp_servers.hyprharness.env]`. A stale signature is the usual cause of
+`connection closed: initialize response` after restarting the computer.
+
+Restart Codex after changing its configuration or replacing the release binary.
+Codex starts `hyprharness mcp` itself; do not run a second copy manually. `/mcp`
+should list the 13 tools. `Auth: Unsupported` is normal for a local stdio server
+and does not mean registration failed.
+
+### 4. Smoke test
+
+Start with observation, then a harmless pointer move:
+
+```text
+Use the hyprharness MCP server.
+1. Call get_cursor.
+2. Call list_windows and summarize the visible windows.
+3. Call observe_desktop on the focused monitor and describe what you see.
+4. Move the pointer 200 logical pixels to the right using natural motion.
+5. Call get_cursor again and verify the final position.
+Do not click or type.
+```
+
+For a first guarded click, ask Codex to observe immediately before acting and
+name the exact visible target.
+
+## What it can do
+
+### Observe
+
+- Capture the focused monitor as PNG.
+- Return the active window, monitor geometry, cursor position, capture hash,
+  and coordinate-system metadata with the image.
+- Query mapped windows and workspaces as structured JSON.
+- Read the current cursor position without taking a screenshot.
+
+### Act
+
+- Move through an entire natural, smooth, or instant pointer trajectory.
+- Move, decelerate, settle at a target, verify the target is still valid, and
+  click as one guarded action.
+- Click, scroll, press key chords, and type text.
+- Focus a window by stable Hyprland address and switch numeric workspaces.
+
+### Choreograph
+
+- Execute up to 32 typed actions in one deterministic `run_sequence` call.
+- Insert brief waits between actions for animations and video pacing.
+- Guard actions against the expected window and workspace.
+- Fail fast, preserve per-step results, and optionally capture a final frame.
+
+### Contain and audit
+
+- Reject input while the session is locked or the server is read-only.
+- Validate coordinates against the live monitor layout.
+- Serialize actions so separate requests cannot interleave pointer or keyboard
+  events.
+- Apply rate limits and record every state-changing attempt in rotating JSONL.
 
 ## Architecture
 
@@ -27,245 +166,308 @@ Codex CLI
     │ MCP JSON-RPC over stdio
     ▼
 hyprharness
-    ├── Hyprland UNIX socket IPC
-    ├── grim screenshot capture
-    ├── wlr virtual-pointer input
-    ├── wtype virtual-keyboard input
-    ├── lock/bounds/rate safety policy
-    └── rotating JSONL action audit
+    │
+    ├── Hyprland IPC — state and control plane
+    │   ├── query cursor
+    │   ├── query monitors/windows
+    │   ├── query lock state
+    │   ├── focus window
+    │   ├── switch workspace
+    │   └── verify final cursor position
+    │
+    ├── Persistent Wayland virtual pointer — input plane
+    │   ├── move complete 60 Hz trajectory
+    │   ├── click
+    │   └── scroll
+    │
+    ├── grim — screenshot capture
+    ├── wtype — keyboard and text input
+    ├── safety policy + action lock
+    └── rotating JSONL audit log
 ```
 
-Hyprland IPC is the state/control plane for cursor queries, monitor/window discovery, focus, lock state, and workspace switching. Pointer movement, clicks, and scrolling share one persistent `zwlr_virtual_pointer_v1` Wayland device; complete 60 Hz trajectories are sent to its dedicated actor instead of opening a compositor socket for every frame. Screenshots use `grim` with a fixed argument list, never a shell, and keyboard input uses `wtype` with Wayland's virtual-keyboard protocol. No privileged `uinput` daemon is required.
+The split between state and input is deliberate. Hyprland IPC is authoritative
+for compositor state, window operations, lock state, and final verification.
+Pointer events travel through Wayland's native virtual-pointer protocol.
 
-## Build and verify
+For a move, the harness calculates and validates the complete trajectory first,
+then sends that path to one long-lived pointer actor. The actor emits absolute
+Wayland motion frames at 60 updates per second, flushes each frame, performs one
+final synchronization, and leaves the connection alive for the next move,
+click, or scroll. This avoids spawning a process or opening a Hyprland IPC
+round-trip for every animation frame. Hyprland IPC is queried afterward to
+verify the actual final cursor position.
 
-All project commands are intended to run through `shell.nix`:
+The common action lifecycle is:
 
-```bash
-nix-shell --run 'cargo build --release'
-nix-shell --run 'cargo test --all-features'
-nix-shell --run 'cargo clippy --all-targets --all-features -- -D warnings'
-nix-shell --run 'cargo run -- doctor'
+```text
+observe → plan → validate → act → verify → audit
 ```
 
-The runtime expects a live Hyprland session with `XDG_RUNTIME_DIR`, `HYPRLAND_INSTANCE_SIGNATURE`, and `WAYLAND_DISPLAY` inherited from Codex.
+Coordinates use Hyprland global logical space. The Wayland backend maps that
+space across the complete active monitor layout, including negative monitor
+origins and scaled outputs. Screenshot pixels can differ from logical
+coordinates when monitor scaling is enabled; observation results include both
+geometries so callers can transform them correctly.
 
-## Register with Codex
-
-Build the release binary, then register its absolute path from inside `nix-shell` so the forwarded `PATH` contains both `grim` and `wtype`. The Hyprland/Wayland variables must also be forwarded to the stdio child:
-
-```bash
-codex mcp add hyprharness \
-  --env PATH="$PATH" \
-  -- /absolute/path/to/hyprharness/target/release/hyprharness \
-  mcp --audit-log /absolute/path/to/hyprharness/.hyprharness/audit.jsonl
-codex mcp list
-```
-
-Do not register `HYPRLAND_INSTANCE_SIGNATURE`, `WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR` with `--env`: Codex persists those literal values and the Hyprland signature changes after a reboot. Add `env_vars = ["XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY"]` to the parent `[mcp_servers.hyprharness]` section so they are forwarded from each current Codex session. Keep the Nix-shell `PATH` as the static `.env` value so `grim` and `wtype` remain discoverable.
-
-Use `/mcp` inside a newly started Codex session to confirm that all thirteen tools are available. Codex launches the stdio server itself; do not run `hyprharness mcp` in a separate terminal. `Auth: Unsupported` is expected for a local stdio server.
-
-For unattended local demos where Codex itself is launched from `nix-shell`, the equivalent fully dynamic `config.toml` entry is:
-
-```toml
-[mcp_servers.hyprharness]
-command = "/absolute/path/to/hyprharness/target/release/hyprharness"
-args = ["mcp", "--audit-log", "/absolute/path/to/hyprharness/.hyprharness/audit.jsonl"]
-cwd = "/absolute/path/to/hyprharness"
-env_vars = ["XDG_RUNTIME_DIR", "HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "PATH"]
-required = true
-startup_timeout_sec = 10
-tool_timeout_sec = 60
-default_tools_approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.move_pointer]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.click]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.point_and_click]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.focus_window]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.scroll]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.press_key]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.type_text]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.switch_workspace]
-approval_mode = "approve"
-
-[mcp_servers.hyprharness.tools.run_sequence]
-approval_mode = "approve"
-```
-
-Put this in `~/.codex/config.toml`, or in a trusted project's `.codex/config.toml`. Auto-approval is powerful: only enable it on a machine and session you are comfortable allowing Codex to operate.
-
-## MCP tools
+## MCP tool catalog
 
 | Tool | Purpose |
-| --- | --- |
-| `observe_desktop` | Return a focused/named monitor PNG plus coordinate metadata. |
-| `get_cursor` | Read the global logical cursor position. |
-| `list_windows` | List mapped windows and stable identifiers. |
-| `move_pointer` | Move naturally, smoothly, or instantly to validated coordinates. |
-| `click` | Emit bounded left, middle, or right clicks. |
-| `point_and_click` | Decelerate to a target, settle visibly, then click atomically. |
-| `focus_window` | Focus a mapped window by exact `stableId` or address. |
-| `scroll` | Emit bounded discrete wheel steps at the pointer position. |
-| `press_key` | Press a validated key/shortcut in the focused window. |
-| `type_text` | Type bounded UTF-8 text with optional per-character delay. |
-| `wait` | Pause for bounded UI navigation or asynchronous work. |
-| `switch_workspace` | Focus a numeric Hyprland workspace through compositor IPC. |
-| `run_sequence` | Execute a guarded, fail-fast demo choreography without inter-step latency. |
+|---|---|
+| `observe_desktop` | Capture one monitor and return PNG plus desktop metadata. |
+| `get_cursor` | Return the current global logical cursor position. |
+| `list_windows` | Return mapped Hyprland windows and workspace metadata. |
+| `move_pointer` | Move with `natural`, `smooth`, or `instant` motion. |
+| `click` | Click the current position one to three times. |
+| `point_and_click` | Move, decelerate, settle, guard, verify, and click atomically. |
+| `focus_window` | Focus an exact window address from `list_windows`. |
+| `scroll` | Emit bounded vertical scrolling through the persistent pointer. |
+| `press_key` | Press a key or modified chord through `wtype`. |
+| `type_text` | Type bounded UTF-8 text with an optional per-character interval. |
+| `wait` | Pause for a bounded duration. |
+| `switch_workspace` | Switch to a numeric Hyprland workspace. |
+| `run_sequence` | Preflight and execute a guarded multi-action demo plan. |
 
-See [docs/tools.md](docs/tools.md) for complete inputs, outputs, key names, safety behavior, errors, and recommended agent workflows.
+Full argument schemas, limits, examples, and result shapes are documented in
+[`docs/tools.md`](docs/tools.md).
 
-### Core observation and pointer tools
+## Demo-quality pointer movement
 
-#### `observe_desktop`
+### Natural and smooth trajectories
 
-Input: `{ "monitor"?: string }`. It captures the focused monitor by default and returns:
+`move_pointer` supports three profiles:
 
-- PNG `ImageContent` with the cursor included.
-- Structured metadata with monitor origin, logical dimensions, pixel dimensions, scale, transform, cursor, focused window, byte count, and SHA-256.
+- `natural` is the default. It uses minimum-jerk easing and a restrained curved
+  path so acceleration and deceleration look intentional on video.
+- `smooth` follows a direct eased path.
+- `instant` sends the final coordinate immediately for diagnostics and precise
+  non-demo work.
 
-Pointer coordinates are always Hyprland global logical coordinates. Screenshot pixels can differ when display scaling is enabled.
+Animated movement runs at 60 updates per second to align cleanly with common
+60 fps screen recording. The harness chooses a distance-aware duration when one
+is not supplied; callers can also request a duration from 0 to 3000 ms.
 
-#### `get_cursor` and `list_windows`
+### Settled point-and-click
 
-`get_cursor` returns the global logical cursor position and containing monitor. `list_windows` returns mapped clients with Hyprland stable/address identifiers, title/class, PID, geometry, workspace, monitor, visibility, fullscreen, and focus state.
+`point_and_click` is the preferred tool for product demos. It keeps the move and
+click under one action lock and performs this sequence:
 
-#### `move_pointer`
+1. Validate the target, expected window, and expected workspace.
+2. Move with the requested trajectory and decelerate into the target.
+3. Pause at the target for the settling interval (300 ms by default, up to
+   2000 ms).
+4. Recheck focus and workspace guards.
+5. Confirm the cursor did not move during settling.
+6. Click and return the observed final position.
 
-Input: `{ "x": integer, "y": integer, "motion"?: "natural"|"smooth"|"instant", "duration_ms"?: 0..3000 }`. Destinations outside all active monitor rectangles are rejected.
+That visible pause makes the target legible to viewers and prevents a click if
+the desktop changed underneath the plan.
 
-`natural` is the default. It chooses a distance-aware duration (220–1200 ms), applies human-looking acceleration and deceleration, and follows a subtle bounded curve with at most 60 Wayland motion frames per second to align cleanly with 60 FPS recordings. `smooth` uses the same easing on a straight path. `instant`, or an explicit `duration_ms` of `0`, performs a single absolute Wayland move. Supply a nonzero duration when a demo needs exact pacing. Hyprland IPC verifies every final coordinate, and results identify the `wayland_virtual_pointer` backend.
+### Deterministic sequences
 
-#### `click`
+`run_sequence` removes tool-call latency between closely related demo actions.
+The complete plan is validated before its first side effect, then every step is
+executed in order under one action lock. A failed step stops the sequence.
 
-Input: `{ "button"?: "left"|"middle"|"right", "count"?: 1..3, "interval_ms"?: 40..1000 }`. Defaults are a single left click and 120 ms interval.
-
-#### `point_and_click`
-
-Input: `{ "x": integer, "y": integer, "motion"?: "natural"|"smooth"|"instant", "duration_ms"?: 0..3000, "settle_ms"?: 0..2000, "button"?: "left"|"middle"|"right", "count"?: 1..3, "interval_ms"?: 40..1000, "guard"?: object }`.
-
-This is the preferred recorded-demo action. It holds the global action lock while the pointer follows its eased path and decelerates to zero, pauses at the exact target for 300 ms by default, verifies the pointer stayed there, rechecks optional `focused_window_id`/`workspace_id` guards, and then clicks. Its result reports the movement, requested/measured settling time, and click.
-
-### Window and input tools
-
-- `focus_window`: `{ "window_id": string }`, using an exact `stableId` or address from `list_windows`.
-- `scroll`: `{ "direction": "up"|"down"|"left"|"right", "amount"?: 1..20 }`. Scrolling occurs under the pointer.
-- `press_key`: `{ "key": string, "modifiers"?: ["ctrl"|"alt"|"shift"|"super"], "repeat"?: 1..20, "expected_window_id"?: string }`.
-- `type_text`: `{ "text": string, "interval_ms"?: 0..50, "expected_window_id"?: string }`. Supports UTF-8 through `wtype`.
-- `wait`: `{ "duration_ms": 0..30000 }`.
-- `switch_workspace`: `{ "workspace_id": integer >= 1 }`.
-
-For keyboard safety, first call `list_windows`, focus the intended `stableId`, then pass the same ID as `expected_window_id`. This rejects stale focus immediately before injection; it cannot prevent an external focus change that happens during a long typing operation.
-
-### Deterministic demo sequences
-
-`run_sequence` executes 1–32 typed actions serially while holding the server's action lock. It is intended for rehearsed demo segments that do not require Codex to inspect an intermediate screen before choosing the next action. Plans are limited to 45 seconds, individual sequence waits to 10 seconds, and execution always stops on the first error.
+Conceptually, a sequence can look like this:
 
 ```json
 {
+  "expected_window_id": "0x1234abcd",
+  "expected_workspace": 3,
+  "capture_final": true,
   "steps": [
     {
       "action": "point_and_click",
-      "x": 1450,
-      "y": 180,
-      "duration_ms": 900,
-      "settle_ms": 300,
-      "button": "left",
-      "guard": { "focused_window_id": "180000b1", "workspace_id": 2 }
+      "x": 420,
+      "y": 310,
+      "motion": "natural",
+      "duration_ms": 700,
+      "settle_ms": 350,
+      "button": "left"
     },
-    { "action": "wait", "duration_ms": 800 },
-    { "action": "switch_workspace", "workspace_id": 3 }
-  ],
-  "observe_at_end": true
+    { "action": "wait", "duration_ms": 500 },
+    { "action": "type_text", "text": "Hello from hyprharness", "interval_ms": 25 },
+    { "action": "press_key", "key": "enter" }
+  ]
 }
 ```
 
-The complete plan is statically checked before execution and each optional guard is checked again immediately before its step. A final observation can return both PNG content and structured metadata. Use separate MCP calls when the next action depends on interpreting an intermediate observation.
+Use the exact schema returned by MCP discovery; the example emphasizes the
+workflow rather than replacing the tool schema. A sequence accepts 1–32 steps,
+has a maximum planned duration of 45 seconds, and limits each wait step to 10
+seconds. Each result includes step timing and correlation metadata for the
+audit trail.
 
-## Safety
+## Safety model
 
-Desktop input tools are armed by default for autonomous demos. Start a read-only server when you only want observation and waits:
+`hyprharness` is a narrow trusted process between the model and the desktop. It
+does not expose arbitrary programs, shell arguments, or raw compositor commands.
 
-```bash
-hyprharness mcp --read-only
-```
+Before an input action, the server checks:
 
-Regardless of Codex approval settings, the trusted server:
+- the session is not locked;
+- input is allowed (the server was not started with `--read-only`);
+- the target lies inside an enabled, powered monitor;
+- the requested button, key, text, repeat, interval, and duration are bounded;
+- any expected window or workspace guard still matches; and
+- the relevant rate limit has capacity.
 
-- Denies focus, pointer, and keyboard input while Hyprland reports the session locked.
-- Rejects positions outside enabled, powered monitors.
-- Limits movement, click, focus, scroll, and keyboard event rates independently.
-- Validates button, click-count, scroll amount, key names, modifiers, repeats, text size, delays, and wait bounds.
-- Serializes all input actions; `point_and_click` keeps movement, settling, guard recheck, and click indivisible.
-- Preflights sequence size/duration and stops choreography on the first failed live guard or action.
-- Optionally verifies the expected focused window immediately before keyboard injection.
-- Exposes no command, executable, or shell-string arguments.
-- Stops state-changing actions when the audit log is unavailable.
+Current per-minute limits are:
 
-Terminate the `hyprharness` process or disable the MCP server in Codex as the immediate emergency stop.
+| Action class | Limit |
+|---|---:|
+| Pointer moves | 300 |
+| Clicks | 60 |
+| Window focus/workspace operations | 120 |
+| Scroll actions | 240 |
+| Keyboard events | 2000 |
 
-## Audit log
+All input is serialized by a shared action lock. A sequence owns that lock for
+its complete run, and `point_and_click` owns it across motion, settling, and the
+click. State-changing actions fail closed if their audit record cannot be
+written.
 
-The default path is `$XDG_STATE_HOME/hyprharness/audit.jsonl`, falling back to `~/.local/state/hyprharness/audit.jsonl`. Override it with `mcp --audit-log PATH`.
-
-Records contain UTC timestamp, server/request IDs, tool, validated arguments, focused window address, before/after cursor positions, duration, success, and error code. Sequence parent/child records share a `sequence_id`, and child actions include `step_index`. Screenshot bytes are never logged—only monitor, dimensions, size, and hash. Typed text is also redacted in both standalone and sequence records: logs contain only character/byte counts, delay, and SHA-256. Files use mode `0600`, rotate at 10 MiB, and retain five archives.
-
-## Diagnostics
-
-```bash
-hyprharness doctor [--json]
-hyprharness observe [--monitor eDP-1] [--output /tmp/desktop.png]
-hyprharness test-pointer [--distance 40]
-hyprharness test-pointer --click --yes
-hyprharness permissions [--json]
-```
-
-`doctor` and `permissions` now probe both the virtual pointer and virtual keyboard backends. `test-pointer` restores the original cursor position and will not emit a click unless both `--click` and `--yes` are supplied.
-
-If Hyprland compositor permissions are enforced, permit the Nix-store `grim` binary or use Hyprland's interactive `ask` mode. `hyprharness permissions` reports the current compositor option and backend availability without changing configuration.
-
-## Live tests
-
-Live tests are ignored during the normal suite:
+For observation-only use:
 
 ```bash
-nix-shell --run 'cargo test --test live_hyprland observes_live_desktop -- --ignored --nocapture'
-nix-shell --run 'cargo test --test live_hyprland moves_and_restores_live_pointer -- --ignored --nocapture'
-nix-shell --run 'cargo test --test live_hyprland runs_and_audits_live_sequence -- --ignored --nocapture'
+nix-shell --run 'target/release/hyprharness mcp --read-only'
 ```
 
-The live suite safely probes screenshots, focus-on-current-window, waits, keyboard availability, and reversible movement. Side-effectful input remains opt-in:
+The immediate emergency stop is to terminate the MCP process or disable the
+server in Codex.
 
-- `HYPRHARNESS_LIVE_CLICK=1` enables one click.
-- `HYPRHARNESS_LIVE_SCROLL=1` enables a down/up scroll pair.
-- `HYPRHARNESS_LIVE_KEYBOARD=1` enables a shortcut and text entry test in the focused window.
+## Audit trail
 
-## Roadmap
+The default log is:
 
-The next capability layer is session recording and richer telemetry. The input interfaces are intentionally separate so future clipboard, drag, touch, and recording support can receive independent safety and audit policies.
+```text
+$XDG_STATE_HOME/hyprharness/audit.jsonl
+```
 
-## References
+When `XDG_STATE_HOME` is unset, it falls back to
+`~/.local/state/hyprharness/audit.jsonl`. The path can be overridden with
+`--audit-log`.
 
+The log:
+
+- is created with mode `0600`;
+- rotates at 10 MiB and retains five archives;
+- records timestamps, session and request IDs, tool name, validated arguments,
+  active-window context, cursor positions, duration, and success or error;
+- correlates sequence parent and child records with sequence and step IDs;
+- stores screenshot metadata and hashes, never PNG bytes; and
+- redacts typed text, retaining only its length and hash.
+
+## Human CLI and diagnostics
+
+The MCP server is the primary runtime, but the binary also includes a small
+diagnostic CLI:
+
+```bash
+# Show commands
+nix-shell --run 'target/release/hyprharness --help'
+
+# Check dependencies, environment, IPC, and protocols
+nix-shell --run 'target/release/hyprharness doctor'
+
+# Capture the focused monitor and print metadata
+nix-shell --run 'target/release/hyprharness observe'
+
+# Explain runtime permissions and safety behavior
+nix-shell --run 'target/release/hyprharness permissions'
+
+# Move right and back; no click
+nix-shell --run 'target/release/hyprharness test-pointer --distance 40'
+
+# Explicit live click test
+nix-shell --run 'target/release/hyprharness test-pointer --click --yes'
+```
+
+The click test requires both flags so it cannot be triggered accidentally.
+
+## Development and verification
+
+Keep development commands inside `shell.nix` so build-time and runtime
+dependencies match:
+
+```bash
+nix-shell --run 'cargo fmt --check'
+nix-shell --run 'cargo check --all-targets'
+nix-shell --run 'cargo test'
+nix-shell --run 'cargo clippy --all-targets -- -D warnings'
+nix-shell --run 'cargo build --release'
+```
+
+Useful targeted tests include:
+
+```bash
+nix-shell --run 'cargo test pointer_trajectory'
+nix-shell --run 'cargo test sequence'
+nix-shell --run 'cargo test safety'
+```
+
+Live desktop tests should be deliberate: inspect the desktop first, use a
+non-destructive target, and prefer `point_and_click` with window/workspace
+guards over a bare click.
+
+## Troubleshooting
+
+### Codex shows `Tools: (none)` after a reboot
+
+Remove hard-coded values for `HYPRLAND_INSTANCE_SIGNATURE`, `WAYLAND_DISPLAY`,
+and `XDG_RUNTIME_DIR` from `[mcp_servers.hyprharness.env]`. Put their names in
+the parent table's `env_vars` array, restart Codex from the live Hyprland
+session, and check `/mcp` again.
+
+### MCP initialization closes before listing tools
+
+Run:
+
+```bash
+nix-shell --run 'target/release/hyprharness doctor'
+```
+
+Also confirm the configured binary exists and is current, the audit directory
+is writable, and the server's `PATH` contains `grim` and `wtype`. Server logs
+must go to stderr; stdout is reserved for MCP JSON-RPC.
+
+### `/mcp` says `Auth: Unsupported`
+
+That is expected. `hyprharness` is a local process connected over stdio, so it
+does not perform an HTTP authentication flow.
+
+### Pointer input is denied
+
+Check whether the screen is locked, the server uses `--read-only`, the target is
+outside the active monitor layout, or a live window/workspace guard no longer
+matches.
+
+### A screenshot target and logical coordinate do not line up
+
+Image pixels and Hyprland logical coordinates differ on scaled monitors. Use the
+monitor and coordinate-system metadata returned by `observe_desktop` rather
+than treating screenshot pixels as global coordinates directly.
+
+## Scope and direction
+
+The project currently focuses on reliable, explainable primitives for local
+product demos and desktop automation. The strong foundation is already in
+place: observation, native pointer input, keyboard input, window/workspace
+control, guarded actions, deterministic sequences, and a correlated audit log.
+
+Natural extensions include drag and drop, recording lifecycle tools, richer
+telemetry, reusable named demo scripts, and interactive permission prompts.
+They should preserve the same design rule: small typed capabilities, live-state
+validation, deterministic execution, and complete auditing.
+
+## Further reading
+
+- [`docs/tools.md`](docs/tools.md) — complete MCP tool reference
 - [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
-- [Official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
-- [Hyprland IPC](https://wiki.hypr.land/IPC/)
-- [Using hyprctl](https://wiki.hypr.land/Configuring/Advanced-and-Cool/Using-hyprctl/)
-- [Hyprland dispatchers](https://wiki.hypr.land/Configuring/Basics/Dispatchers/)
-- [Hyprland permissions](https://wiki.hypr.land/Configuring/Permissions/)
+- [Hyprland IPC documentation](https://wiki.hypr.land/IPC/)
+- [Hyprland dispatchers](https://wiki.hypr.land/Configuring/Dispatchers/)
+- [wlr virtual pointer protocol](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1)
 
 ## License
 
